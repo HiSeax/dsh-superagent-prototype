@@ -52,6 +52,28 @@ declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceH
 const now = (): string => new Date().toISOString()
 
 /**
+ * Wait until this process can take the state-directory lock, then release it so the `Runtime` constructor can take it again.
+ * A process killed without running its close hook (Windows has no safe SIGINT, so the service manager force-kills it) leaves
+ * the lock behind; proper-lockfile only treats it as stale after `staleMs`, so a fast replacement would otherwise fail to
+ * activate dsh-superagent and leave every `/orchestrator/api/*` route unregistered. Retrying here makes a fast restart
+ * succeed once the previous lock ages out instead of dropping the whole plugin.
+ */
+export async function waitForStateLock(stateDir: string, { staleMs = 30_000, timeoutMs = 45_000 } = {}): Promise<void> {
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    try {
+      const release = lockSync(stateDir, { stale: staleMs })
+      await release()
+      return
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ELOCKED' || Date.now() >= deadline) throw error
+      await new Promise(resolve => setTimeout(resolve, 1_000))
+    }
+  }
+}
+
+/**
  * Composition root of dsh-superagent that connects `Store`, `Setup`, `Engine`, `SourceRegistry`, `Effects`, `Outbox`, `Passes`, `Sessions`, `Settings`, `Prompts`, `DshExecutor`, and `MasterAssessor`.
  * Exposes the `SourceHost` service on the Cordis context for source plugins and coordinates startup, setup checks, HTTP route registration, and graceful shutdown.
  * Locks the state directory before opening SQLite so concurrent processes cannot corrupt or double-migrate state.

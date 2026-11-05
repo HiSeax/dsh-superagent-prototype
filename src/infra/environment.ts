@@ -20,11 +20,16 @@ export const workerBin = (stateDir: string): string => join(stateDir, 'worker-bi
 export const workerGitConfig = (stateDir: string): string => join(stateDir, 'worker-gitconfig')
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
 const gitQuote = (value: string): string => `"${value.replace(/[\\"]/g, char => `\\${char}`)}"`
-export const credentialHelper = (cli: string): string => `!${shellQuote(cli)} auth git-credential`
+/** Git runs `!` helpers through sh, which takes a Windows path more reliably with forward slashes. */
+const shPath = (value: string): string => process.platform === 'win32' ? value.replaceAll('\\', '/') : value
+export const credentialHelper = (cli: string): string => `!${shellQuote(shPath(cli))} auth git-credential`
 
 export function sameDirectory(a: string, b: string): boolean {
   const real = (path: string): string => { try { return realpathSync(path) } catch { return resolve(path) } }
-  return real(a) === real(b)
+  const left = real(a)
+  const right = real(b)
+  // Windows paths compare without case.
+  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right
 }
 export function withoutDirectory(path: string, dir: string): string {
   return path.split(delimiter).filter(entry => !sameDirectory(entry, dir)).join(delimiter)
@@ -139,7 +144,9 @@ export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 
   const { github, stateDir } = deployment
   // `-z` separates fields with NUL and never quotes paths.
   const helpers = (await runAsWorker(subprocess, ['git', 'config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper'], stateDir, AbortSignal.any([signal, AbortSignal.timeout(60_000)])).catch(() => '')).split('\0')
-  if (helpers.join('\0') !== [`file:${workerGitConfig(stateDir)}`, credentialHelper(github.cli), ''].join('\0')) throw new SetupError('gitTooOld')
+  // Git prints origins with forward slashes, and Windows paths compare without case.
+  const comparable = (value: string): string => process.platform === 'win32' ? value.replaceAll('\\', '/').toLowerCase() : value
+  if (comparable(helpers.join('\0')) !== comparable([`file:${workerGitConfig(stateDir)}`, credentialHelper(github.cli), ''].join('\0'))) throw new SetupError('gitTooOld')
 }
 
 /**
