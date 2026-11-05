@@ -38,6 +38,7 @@ const TEXT = {
   'health.weixin': ['微信登录', 'WeChat login'],
   'health.weixin-poll': ['微信收消息', 'WeChat polling'],
   'health.weixin-send': ['微信发送', 'WeChat sends'],
+  'health.weixin-media': ['微信图片', 'WeChat images'],
   'health.github': ['GitHub 来源', 'GitHub Source'],
   'health.feishu': ['飞书来源', 'Feishu Source'],
   'health.history': ['飞书补收', 'Feishu recovery'],

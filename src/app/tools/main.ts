@@ -229,10 +229,14 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         purpose: z.enum(['answer', 'result', 'attention']),
         human_action: z.string().trim().min(1).optional().describe('Required for attention: the ticket\'s current attention question.'),
         text: z.string().min(1).max(20000),
+        attachments: z.array(z.object({ path: z.string().min(1).describe('An absolute path of a local image file, such as one a tool wrote.'),
+          mime: z.string().optional().describe('The image type, when known: image/png, image/jpeg, image/webp or image/gif.') }))
+          .max(4).optional().describe('Images to send beside the text, for a Channel that carries them; a Channel without image support still sends the text. Only PNG, JPEG, WebP and GIF, at most the Source\'s configured media size.'),
       }).strict(),
       execute: async args => {
         const reply = host.engine.reply({ purpose: args.purpose, text: args.text, ...(args.trigger_id ? { triggerId: args.trigger_id } : {}),
-          ...(args.ticket_id ? { ticketId: args.ticket_id } : {}), ...(args.human_action ? { question: args.human_action } : {}) })
+          ...(args.ticket_id ? { ticketId: args.ticket_id } : {}), ...(args.human_action ? { question: args.human_action } : {}),
+          ...(args.attachments?.length ? { attachments: args.attachments } : {}) })
         await host.sendReplies()
         return { status: host.store.replyStatus(reply.id) ?? reply.status }
       },

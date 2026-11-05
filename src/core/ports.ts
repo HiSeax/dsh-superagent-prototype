@@ -68,8 +68,18 @@ export interface Executor {
   stop(ticket: Ticket, assignment: Assignment, reason: string): void
 }
 
+/**
+ * A local file a Channel may carry beside an OutboundMessage's text. `mime` is the type the producer intends; a Channel
+ * that cannot carry attachments still delivers the text, and one that carries them chooses by type, so a Channel refusing
+ * one reports it instead of sending something else.
+ */
+export interface OutboundAttachment { path: string; mime?: string; name?: string }
 /** A message for a Channel; `ticketId` names the Ticket it is for, when there is one. */
-export interface OutboundMessage { id: string; channel: ChannelRef; text: string; kind: 'acknowledgement' | 'reply' | 'notice'; ticketId?: string }
+export interface OutboundMessage {
+  id: string; channel: ChannelRef; text: string; kind: 'acknowledgement' | 'reply' | 'notice'; ticketId?: string
+  /** Local files to attach beside the text, in order; a Channel that has no attachment support sends the text alone. */
+  attachments?: OutboundAttachment[]
+}
 /** A queued message waits (`pending`), went out (`sent`), or was dropped because its conversation can never receive it (`dropped`). */
 export type ReplyStatus = 'pending' | 'sent' | 'dropped'
 /** The messages queued for Channels; the Engine queues them inside its commands, and a sender delivers them later. */

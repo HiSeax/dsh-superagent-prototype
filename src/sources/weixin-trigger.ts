@@ -1,23 +1,33 @@
 /**
  * Normalizes an iLink Bot update into a domain Trigger.
  *
- * Alignment: the inbound `WeixinMessage` shape of zhayujie/CowAgent `channel/weixin/weixin_message.py` and the item
- * vocabulary of SiverKing/weixin-ClawBot-API (openclaw-weixin 2.4.6). iLink delivers direct messages only: the official
- * plugin declares `direct` chats and its send path has no group branch, so a message carrying `group_id` is not a Trigger.
+ * Alignment: the inbound `WeixinMessage` shape of zhayujie/CowAgent `channel/weixin/weixin_message.py`, the item
+ * vocabulary of SiverKing/weixin-ClawBot-API and `Tencent/openclaw-weixin` (2.4.6), and the media sections 2.9 and 5.4 of
+ * the ClawBot docs for the `image_item` fields. iLink delivers direct messages only: the official plugin declares `direct`
+ * chats and its send path has no group branch, so a message carrying `group_id` is not a Trigger.
+ *
+ * An image item has no text of its own: the runtime downloads it from the CDN, stores it under the state directory, and
+ * passes the stored media here, which adds the `[Image: <key>]` reference an assessment reads the file by. A message whose
+ * images could not be downloaded still becomes a Trigger, naming them unread, so a person's picture is not dropped silently.
  */
 import { z } from 'zod'
 import { key, type ChannelRef, type Trigger } from '../core/index.ts'
+import { mediaMarker, type CdnMedia, type StoredMedia } from './weixin-media.ts'
 
 export const SOURCE = 'weixin'
 /** The admission row: every iLink conversation is a direct chat with the bot, so one row covers the Source. */
 export const DIRECT_ROW = 'direct'
-/** `MessageItem.type` values of the text-only subset this Source can use; media has no read path here. */
+/** `MessageItem.type` values: text, image, voice, file and video; media has a read path only for images. */
 const ITEM_TEXT = 1, ITEM_IMAGE = 2, ITEM_VOICE = 3, ITEM_FILE = 4, ITEM_VIDEO = 5
 const TextItemSchema = z.looseObject({ text: z.string().optional() })
+/** `CDNMedia`: the encrypted download parameter, an optional full URL, and the AES key in whichever encoding the item used. */
+const MediaSchema = z.looseObject({ encrypt_query_param: z.string().optional(), aes_key: z.string().optional(),
+  full_url: z.string().optional(), encrypt_type: z.number().optional() })
+const ImageItemSchema = z.looseObject({ media: MediaSchema.optional(), aeskey: z.string().optional(), mid_size: z.number().optional() })
 const RefMessageSchema = z.looseObject({ title: z.string().optional(),
   message_item: z.looseObject({ type: z.number().optional(), text_item: TextItemSchema.optional() }).optional() })
 const ItemSchema = z.looseObject({ type: z.number(), text_item: TextItemSchema.optional(), voice_item: z.looseObject({ text: z.string().optional() }).optional(),
-  ref_msg: RefMessageSchema.optional() })
+  image_item: ImageItemSchema.optional(), ref_msg: RefMessageSchema.optional() })
 /** One inbound update; `message_id` is optional in the references, which fall back to `seq`. */
 export const WeixinMessageSchema = z.looseObject({
   message_id: z.union([z.string(), z.number()]).optional(), seq: z.union([z.string(), z.number()]).optional(),
@@ -33,11 +43,11 @@ export const weixinChannel = (userId: string): ChannelRef => ({ source: SOURCE, 
 /** Deterministic Trigger ID for one inbound message; equal messages always produce the same id. */
 export const weixinTriggerId = (userId: string, messageId: string): string => key(SOURCE, userId, messageId)
 
-/** What one update's text and items say: the readable text, and whether a media item this Source cannot read came along. */
+/** What one update's text and items say: the readable text, and whether a media item came along that has no text of its own. */
 export interface ParsedItems { text: string; media: boolean; quoted: string }
 /**
  * Flattens a message's `item_list`. A voice item's `text` is the phone's transcription, which the references use as the
- * message's text; an image, file, video or untranscribed voice leaves the text empty and is reported as media. A quoted
+ * message's text; an untranscribed voice, an image, file or video leaves the text empty and is reported as media. A quoted
  * message contributes `[引用: …]` the way CowAgent renders it.
  */
 export function parseItems(items: readonly unknown[]): ParsedItems {
@@ -67,17 +77,44 @@ export function parseItems(items: readonly unknown[]): ParsedItems {
   return { text: [...quotes, ...texts].join('\n'), media, quoted: quotes.join('\n') }
 }
 /**
- * Converts one inbound update into a Trigger, or returns undefined for anything this Source cannot represent: a group
- * message (iLink send has no group branch), a missing sender, a text-less media message, or an empty message.
- * @param message - one `msgs[]` entry of a `getUpdates` reply.
+ * The download references of a message's image items, in order. The key may sit in `media.aes_key` (base64) or in the
+ * item's own `aeskey` (usually hex); the runtime resolves either form and reports what it cannot download.
  */
-export function weixinTrigger(message: WeixinMessage, now = (): number => Date.now()): Trigger | undefined {
+export function inboundImages(items: readonly unknown[]): CdnMedia[] {
+  const refs: CdnMedia[] = []
+  for (const raw of items) {
+    const parsed = ItemSchema.safeParse(raw)
+    if (!parsed.success || parsed.data.type !== ITEM_IMAGE) continue
+    const image = parsed.data.image_item
+    if (!image) continue
+    const aesKey = image.media?.aes_key ?? image.aeskey
+    refs.push({
+      ...image.media?.encrypt_query_param ? { encryptQueryParam: image.media.encrypt_query_param } : {},
+      ...image.media?.full_url ? { fullUrl: image.media.full_url } : {},
+      ...aesKey ? { aesKey } : {},
+    })
+  }
+  return refs
+}
+/** Where a message's own image items could not be downloaded: the text names that instead of dropping the message. */
+export const UNREAD_MEDIA = '[图片: 无法获取]'
+/**
+ * Converts one inbound update into a Trigger, or returns undefined for anything this Source cannot represent: a group
+ * message (iLink send has no group branch), a missing sender, a text-less media message nothing was stored for, or an empty
+ * message.
+ * @param message - one `msgs[]` entry of a `getUpdates` reply.
+ * @param media - the images the runtime stored for this message; each adds its `[Image: <key>]` reference to the text.
+ * @param unread - how many image items the runtime could not download; one note is added when any was.
+ */
+export function weixinTrigger(message: WeixinMessage, now = (): number => Date.now(), media: readonly StoredMedia[] = [],
+  unread = 0): Trigger | undefined {
   if (message.group_id) return undefined
   if (!message.from_user_id) return undefined
   const parsed = parseItems(message.item_list)
-  const text = parsed.text.trim()
-  // A picture, file, video or untranscribed voice has no text this Source can carry: the references would download and
-  // decrypt it from the CDN, which this Source deliberately does not implement, so such a message is not a Trigger.
+  const markers = [...media.map(item => mediaMarker(item.key)), ...unread > 0 ? [UNREAD_MEDIA] : []]
+  const text = [parsed.text.trim(), ...markers].filter(part => part).join('\n')
+  // A picture, file, video or untranscribed voice the runtime could not fetch has no text to carry: without a stored image
+  // or an unread note there is nothing an assessment could act on, so it is not a Trigger.
   if (!text) return undefined
   const rawId = message.message_id ?? message.seq
   const messageId = rawId === undefined ? key(SOURCE, 'synthetic', message.from_user_id, String(message.create_time_ms ?? now()), text) : String(rawId)
@@ -86,5 +123,6 @@ export function weixinTrigger(message: WeixinMessage, now = (): number => Date.n
   return { id: weixinTriggerId(message.from_user_id, messageId), source: SOURCE,
     threads: [{ source: SOURCE, id: weixinThreadId(message.from_user_id) }], actor: { source: SOURCE, id: message.from_user_id },
     human: true, addressed: 'direct', at, text, channel: weixinChannel(message.from_user_id),
-    meta: { userId: message.from_user_id, messageId, direct, createTime: at, ...parsed.media ? { media: true } : {} } }
+    meta: { userId: message.from_user_id, messageId, direct, createTime: at, ...parsed.media || markers.length ? { media: true } : {},
+      ...media.length ? { images: media.map(item => ({ key: item.key, path: item.path, mime: item.mime, bytes: item.bytes })) } : {} } }
 }
