@@ -16,9 +16,10 @@ import { lockSync } from 'proper-lockfile'
 import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { deliverBootNotice, hostBootAt, lastBootLine, watchdogLog } from './boot-notice.ts'
+import { deliverHeartbeat, HEARTBEAT_TICK_MS, NO_HEARTBEAT } from './heartbeat.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
-import type { Deployment, Machine } from '../deployment.ts'
+import type { Deployment, HeartbeatConfig, Machine } from '../deployment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
 import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../executor/dsh.ts'
@@ -103,6 +104,10 @@ export class Runtime extends Service implements SourceHost {
   readonly bootAt: Date = hostBootAt()
   /** Whether the host-start self-check is delivered; the plugin entry sets it from its configuration. */
   private readonly bootNotice: boolean = false
+  /** The heartbeat's settings; the plugin entry sets them from its configuration. */
+  private readonly heartbeatConfig: HeartbeatConfig
+  /** When the last heartbeat was delivered in this process, so the interval counts from the message, not the tick. */
+  private lastHeartbeatAt?: Date
   /** DSH Sessions a Source kind may channel, such as the local Session Source. */
   readonly dshSessions: SourceSessions
   private readonly sourceLinks = new TextCache(200_000)
@@ -115,9 +120,10 @@ export class Runtime extends Service implements SourceHost {
   private readonly toolHost: MainToolsHost & ExecutorToolsHost
   /** Non-zero while a main-Session tool is executing an Engine command, suppressing self-triggered domain event notices. */
   private quiet = 0
-  constructor(ctx: Context, readonly machine: Machine, restart: () => void, options: { bootNotice?: boolean } = {}) {
+  constructor(ctx: Context, readonly machine: Machine, restart: () => void, options: { bootNotice?: boolean; heartbeat?: HeartbeatConfig } = {}) {
     super(ctx, 'orchestrator')
     this.bootNotice = options.bootNotice ?? false
+    this.heartbeatConfig = options.heartbeat ?? NO_HEARTBEAT
     const runtime = this
     // Lock the state directory before opening the database so another process cannot migrate or write concurrently.
     mkdirSync(machine.stateDir, { recursive: true, mode: 0o700 })
@@ -251,6 +257,7 @@ export class Runtime extends Service implements SourceHost {
     this.effects.start()
     await this.announceBoot().catch(error => { this.ctx.logger.warn('dsh-superagent could not deliver its boot self-check: %s', String(error)) })
     this.runtimeHealth.set({ state: 'ready', detail: 'Orchestrator is ready', at: now() })
+    this.startHeartbeat()
   }
   /**
    * Queues the host-start self-check for the main Session once per host boot. The relay is durable, and the request id
@@ -260,6 +267,28 @@ export class Runtime extends Service implements SourceHost {
     if (!this.bootNotice) return
     await deliverBootNotice({ enabled: true, masterId: this.masterId, bootAt: this.bootAt, watchdog: lastBootLine(watchdogLog()),
       deliver: (requestId, text) => { this.sessions.relay(requestId, text) } })
+  }
+  /**
+   * Starts the minute tick that delivers the heartbeat while it is due. The timer is unref'd and registered in
+   * `disposers`, so `stop()` clears it; a failed delivery is logged and never rejects the timer.
+   */
+  private startHeartbeat(): void {
+    if (!this.heartbeatConfig.enabled) return
+    const timer = setInterval(() => { void this.heartbeatTick() }, HEARTBEAT_TICK_MS)
+    timer.unref()
+    this.disposers.push(() => { clearInterval(timer) })
+  }
+  /** Delivers one heartbeat when it is due and remembers the instant, so the next one waits a whole interval. */
+  private async heartbeatTick(): Promise<void> {
+    if (this.closing() || !this.heartbeatConfig.enabled) return
+    const at = new Date()
+    try {
+      const requestId = await deliverHeartbeat({ config: this.heartbeatConfig, masterId: this.masterId, now: at,
+        lastAt: this.lastHeartbeatAt, deliver: (requestId, text) => { this.sessions.relay(requestId, text) } })
+      if (requestId) this.lastHeartbeatAt = at
+    } catch (error) {
+      this.ctx.logger.warn('dsh-superagent could not deliver its heartbeat: %s', String(error))
+    }
   }
   private httpHost(): HttpHost {
     const runtime = this

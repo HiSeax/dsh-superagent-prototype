@@ -15,6 +15,36 @@ const ABSOLUTE = process.platform === 'win32' ? /^(?:\/|[A-Za-z]:[\\/]|\\\\)/ : 
 /** Windows resolves a bare command name by appending one of these; POSIX has no such list. */
 const WINDOWS_EXTENSIONS = (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)
 const absolute = (description: string) => s.string().pattern(ABSOLUTE).description(`${description} Absolute path.`)
+/** A local wall clock as the user reads it; `HH:mm`, 24-hour. */
+const clock = (description: string) => s.string().pattern(/^([01]\d|2[0-3]):[0-5]\d$/).description(description)
+/** How the user lets the heartbeat treat one project: work freely, only up to acceptance, or inspect only. */
+export type HeartbeatMode = 'advance' | 'review' | 'readonly'
+export interface HeartbeatProject { name: string; mode: HeartbeatMode }
+/** The periodic heartbeat's settings: when it may fire, how often, and which projects the user authorized. */
+export interface HeartbeatConfig {
+  enabled: boolean
+  intervalMinutes: number
+  activeFrom: string
+  activeTo: string
+  projects: HeartbeatProject[]
+}
+/**
+ * Typed as `any` because TypeScript cannot name the mapped `Dict` type this schema would infer, which breaks
+ * declaration emit for `Config`; the runtime object is still the real schema, so configuration is validated as usual.
+ */
+const HeartbeatSchema: any = s.object({
+  enabled: s.boolean().default(false)
+    .description('Send the periodic follow-up message to the main Session; read when dsh-superagent starts.'),
+  intervalMinutes: s.number().min(5).max(1440).step(1).default(30)
+    .description('Minutes between two heartbeat messages.'),
+  activeFrom: clock('Local time the active window opens (HH:mm); an end earlier than the start wraps past midnight.').default('08:00'),
+  activeTo: clock('Local time the active window closes (HH:mm); the closing minute itself is outside the window.').default('23:00'),
+  projects: s.array(s.object({
+    name: s.string().required().description('Project the user authorizes, as they name it.'),
+    mode: s.union([s.const('advance'), s.const('review'), s.const('readonly')]).required()
+      .description('advance: complete steps autonomously; review: change only up to acceptance by the user; readonly: inspect only.'),
+  })).default([]).description('Authorized projects; empty means status checks only.'),
+}).description('The periodic follow-up message that keeps authorized projects moving.')
 /** Plugin configuration of the dsh-superagent entry. Volatile fields apply without a restart because dsh-superagent reads them on each use; changing `stateDir` remounts the plugin. */
 export const Config = s.object({
   stateDir: absolute('Directory for the database, locks, worker shims, the agent\'s git configuration and, by default, the ticket directories.').required(),
@@ -22,6 +52,7 @@ export const Config = s.object({
     .description('Largest saved prompt configuration, in characters.').volatile(),
   bootNotice: s.boolean().default(true)
     .description('Send one self-check message to the main Session after each host start; read when dsh-superagent starts.'),
+  heartbeat: HeartbeatSchema,
   admissionContextMaxPages: s.number().min(LIMITS.admissionContextMaxPages.min).max(LIMITS.admissionContextMaxPages.max).step(1).default(10)
     .description('Pages of thread context one assessment may read.').volatile(),
   admissionContextTimeoutMs: s.number().min(LIMITS.admissionContextTimeoutMs.min).max(LIMITS.admissionContextTimeoutMs.max).step(1)
@@ -33,6 +64,7 @@ export interface Machine {
   promptMaxChars: Volatile<number>
   admissionContextMaxPages: Volatile<number>
   admissionContextTimeoutMs: Volatile<number>
+  heartbeat: HeartbeatConfig
 }
 const MOVED: Record<string, string> = {
   repository: 'on the GitHub Source', branchPrefix: 'in the prepare command of the Execution settings', github: 'on the GitHub Source',
@@ -44,8 +76,8 @@ const MOVED: Record<string, string> = {
 export function machineOf(config: DeploymentConfig): Machine {
   const unknown = Object.keys(config).filter(key => !(key in (Config.dict ?? {})))
   if (unknown.length) throw new Error(`dsh-superagent configuration has keys it does not use: ${unknown.map(key => MOVED[key] ? `${key} (now ${MOVED[key]})` : key).join(', ')}; docs/006-deployment.md lists the keys`)
-  const { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs } = config
-  return { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs }
+  const { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, heartbeat } = config
+  return { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, heartbeat }
 }
 
 export const GithubAccountsSchema = z.object({

@@ -335,6 +335,7 @@ Some generic modules still refer directly to GitHub or Feishu, and the local Ses
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/local-sessions.ts` | `LocalSessions`: the host capability for a Source that channels a local DSH Session, delivering once per message id, reading a bounded history page, and reporting existence without activating the agent |
 | `src/app/boot-notice.ts` | The host-start self-check: its fixed message, the boot-derived request id that makes it once per host boot across a plugin reload, and the newest start line of the watchdog log |
+| `src/app/heartbeat.ts` | The periodic heartbeat: the four-part follow-up message, the local active window and interval check, and the per-minute request id that makes it one message per time bucket |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
@@ -427,6 +428,7 @@ Some generic modules still refer directly to GitHub or Feishu, and the local Ses
 | `tests/local.spec.ts` | The local Session Source: Trigger translation, the main-Session switch and self-loop filtering, the listened-Session scope, the allowed-sender policy, the idempotent Channel, the paged context read, the plugin entry's intake, and `LocalSessions` |
 | `tests/weixin.spec.ts` | The Weixin Source on a fake HTTP transport: Trigger translation, the persisted long-poll cursor and its per-account reset, idempotent sends and their 24-hour window report, chunk retries, the `-14` re-login, poll failure health, the QR login (PNG and link files, saved credentials, an unscanned login), and the honest no-history reader |
 | `tests/boot-notice.spec.ts` | The host-start self-check: once per host boot and again after a restart, the same id across a reload, the switch, the message text and the watchdog's newest start line |
+| `tests/heartbeat.spec.ts` | The heartbeat: the active window including a wrap past midnight, the interval, one delivery per time bucket, the switch, and the four message parts with the three authorization modes and the empty list |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |

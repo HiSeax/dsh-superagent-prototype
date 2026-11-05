@@ -109,6 +109,7 @@ Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) t
 | `stateDir` | yes | Absolute path: the database, the lock, the command shims in `worker-bin`, the agent's git configuration and, by default, the Ticket directories in `work`. Back it up before upgrades |
 | `promptMaxChars`, `admissionContextMaxPages`, `admissionContextTimeoutMs` | no | The largest saved prompt configuration, and how many Thread pages one assessment reads within what time |
 | `bootNotice` | no | Send one self-check message to the main Session after each host start (default `true`). It wakes the main Session to check interrupted work; it starts nothing and changes no state. Read when dsh-superagent starts |
+| `heartbeat` | no | Send a structured follow-up message to the main Session every `intervalMinutes` (default `30`, 5–1440) while the local clock is inside `activeFrom`–`activeTo` (default `08:00`–`23:00`, wrapping past midnight), for the `projects` the user authorizes with `advance`, `review` or `readonly`. Read when dsh-superagent starts |
 
 After the first start, edit machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Changes apply without restart. `stateDir` cannot be changed there. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
 
@@ -144,6 +145,10 @@ Each profile stores logs and control files under `.artifacts/`:
 - Control files: `control/profiles/<profile>/`, containing the stop marker, lock and process id.
 
 Open the URL printed in the log, then choose **Superagent** in the sidebar.
+
+### Heartbeat
+
+Set `heartbeat.enabled` to `true` to receive a structured follow-up message in the main Session every `heartbeat.intervalMinutes` (default 30) while the local clock is inside `heartbeat.activeFrom`–`heartbeat.activeTo` (default 08:00–23:00; an end earlier than the start wraps past midnight). The message has four fixed parts: the authorization list built from `heartbeat.projects`, what each round should do, the red lines, and the reporting rule. Each project names how far the heartbeat may go: `advance` completes steps autonomously, `review` changes only up to the user's acceptance, and `readonly` inspects only; with no project it says so and stays silent beyond the status check. The request id comes from the local minute, so a repeated tick or a plugin hot reload delivers one message per time bucket. The timer starts after the runtime is ready, a failed delivery is logged and never stops the runtime, and `stop()` clears the timer. Read when dsh-superagent starts, so a change takes a restart.
 
 ### Boot self-check
 
