@@ -190,7 +190,7 @@ Registry configuration methods include `kind`, `instances`, `instance`, `validat
 
 Generic code accesses Source behavior through the registry. `send(message, commands)` calls the kind's Channel and returns `sent`, `gone` or `waiting` if the kind is not installed. `link` resolves its Channel link. `threadContext` pairs a kind's reader with its configuration, or returns nothing when the kind has no reader. Invalid stored configuration disables the instance.
 
-Plugins receive `SourceHost`: the registry, the main Session's id, DSH Sessions for a kind that channels one (`dshSessions`), and `context(kind)`. The kind itself uses a narrower `SourceContext`, built by `sourceContextOf` in `src/app/source-context.ts`. The local Session kind is the only kind that uses `dshSessions`: it listens to `session/event`, delivers through it, and reads its channel's history through it.
+Plugins receive `SourceHost`: the registry, the main Session's id, DSH Sessions for a kind that channels one (`dshSessions`), and `context(kind)`. The kind itself uses a narrower `SourceContext`, built by `sourceContextOf` in `src/app/source-context.ts`. The local Session kind is the only kind that uses `dshSessions`: it listens to `session/event`, delivers through it, and reads the listened Session's history through it.
 
 That context supplies deployment and commands, setup readiness (`ready`, `configured`, `problem`), configuration, `receive`, `atomic`, and typed `state`. It also exposes Thread reads and metadata writes, Ticket reads and binding/closure commands, Trigger reads, `notify` through Outbox, and `report` for declared health entries.
 
@@ -374,11 +374,11 @@ Some generic modules still refer directly to GitHub or Feishu, and the local Ses
 | `src/sources/feishu-loops.ts` | The Feishu loops: the event consumer, history recovery, chat names and polling of subscribed topics |
 | `src/sources/feishu-channel.ts` | The Feishu Channel: topic replies, `sent` or `gone` |
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
-| `src/sources/local.ts` | The local Session kind and plugin entry, exported as `./local-watch`: a separate ordinary DSH Session is configured as its channel, and its listener turns a person's messages into Triggers |
-| `src/sources/local-trigger.ts` | A person's message in a local DSH Session as a Trigger, its Thread and Channel, and the filter that drops the main Session's messages and this plugin's own deliveries |
-| `src/sources/local-channel.ts` | The local Session Channel: delivers a reply into the channel Session, `sent` or `gone` |
-| `src/sources/local-read.ts` | `localThreadContext`: pages a channel Session's history backwards from the Trigger's message for assessments |
-| `src/sources/local-loops.ts` | The local Session Source's intake and health: receives a person's message and labels its Thread, and reports whether every configured channel Session exists |
+| `src/sources/local.ts` | The local Session kind and plugin entry, exported as `./local-watch`: the orchestrator's main Session (switched on) or separate ordinary DSH Sessions are its channels, and its listener turns a person's messages into Triggers |
+| `src/sources/local-trigger.ts` | A person's message in a local DSH Session as a Trigger, its Thread and Channel, and the filter that keeps only a person's messages, so this plugin's own deliveries and the Session's agent never loop |
+| `src/sources/local-channel.ts` | The local Session Channel: delivers a reply into the listened Session (steered into the main Session's turn), `sent` or `gone` |
+| `src/sources/local-read.ts` | `localThreadContext`: pages a listened Session's history backwards from the Trigger's message for assessments |
+| `src/sources/local-loops.ts` | The local Session Source's intake and health: receives a person's message and labels its Thread, and reports the listened Sessions and any configured one that is missing |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
@@ -415,7 +415,7 @@ Some generic modules still refer directly to GitHub or Feishu, and the local Ses
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
-| `tests/local.spec.ts` | The local Session Source: Trigger translation and self-loop filtering, the configured-Session scope, the allowed-sender policy, the idempotent Channel, the paged context read, the plugin entry's intake, and `LocalSessions` |
+| `tests/local.spec.ts` | The local Session Source: Trigger translation, the main-Session switch and self-loop filtering, the listened-Session scope, the allowed-sender policy, the idempotent Channel, the paged context read, the plugin entry's intake, and `LocalSessions` |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
