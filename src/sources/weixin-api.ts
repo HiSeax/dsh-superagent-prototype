@@ -78,11 +78,25 @@ function ensureOk(reply: Record<string, unknown>, what: string): void {
 const UpdatesSchema = z.looseObject({ ret: z.number().optional(), errcode: z.number().optional(), errmsg: z.string().optional(),
   msgs: z.array(z.unknown()).default([]), get_updates_buf: z.string().optional(), longpolling_timeout_ms: z.number().optional() })
 const QrCodeSchema = z.looseObject({ qrcode: z.string().min(1), qrcode_img_content: z.string().default('') })
+const UploadUrlSchema = z.looseObject({ upload_full_url: z.string().optional(), upload_param: z.string().optional() })
 const QrStatusSchema = z.looseObject({ status: z.string(), redirect_host: z.string().optional(), bot_token: z.string().optional(),
   ilink_bot_id: z.string().optional(), ilink_user_id: z.string().optional(), baseurl: z.string().optional() })
 export type QrStatus = z.infer<typeof QrStatusSchema>
 /** One `getUpdates` page: the messages and the cursor to echo next. */
 export interface UpdatesPage { msgs: unknown[]; cursor?: string; longPollMs?: number }
+/**
+ * One `getuploadurl` request: `rawSize`/`rawMd5` describe the plaintext file, `cipherSize` the AES-128-ECB ciphertext, and
+ * `mediaType` is 1 for an image (2 video, 3 file). The references send the AES key as 32 hex characters.
+ */
+export interface UploadUrlRequest { filekey: string; mediaType: number; toUserId: string; rawSize: number; rawMd5: string
+  cipherSize: number; aesKeyHex: string }
+/**
+ * The CDN ticket `getuploadurl` returns: `uploadFullUrl` is preferred when the server names one, and `uploadParam` is the
+ * legacy parameter the transport appends to the CDN's own upload URL. 推定，未验证: whether 2.4.6 can omit both.
+ */
+export interface UploadUrlTicket { uploadFullUrl?: string; uploadParam?: string }
+/** What one `image_item` needs after an upload: the CDN download parameter, the base64 media key, and the ciphertext size. */
+export interface OutboundImage { encryptQueryParam: string; aesKeyBase64: string; ciphertextSize: number }
 
 /** Authenticated iLink business calls; a new instance is built for each confirmed login. */
 export class WeixinApi {
@@ -118,6 +132,30 @@ export class WeixinApi {
     const reply = await this.post('ilink/bot/sendmessage', { msg: { from_user_id: '', to_user_id: to, client_id: clientId,
       message_type: 2, message_state: 2, context_token: contextToken, item_list: [{ type: 1, text_item: { text } }] } },
     this.timeouts.request, 'sendMessage')
+    ensureOk(reply, 'sendMessage')
+  }
+  /**
+   * Asks for a CDN upload ticket for one media file. The reply is the entry to the upload, not the upload itself: the
+   * caller encrypts the file, POSTs it to the returned URL, and keeps the `x-encrypted-param` header for `sendImage`.
+   */
+  async getUploadUrl(request: UploadUrlRequest): Promise<UploadUrlTicket> {
+    const reply = await this.post('ilink/bot/getuploadurl', { filekey: request.filekey, media_type: request.mediaType,
+      to_user_id: request.toUserId, rawsize: request.rawSize, rawfilemd5: request.rawMd5, filesize: request.cipherSize,
+      aeskey: request.aesKeyHex, no_need_thumb: true }, this.timeouts.request, 'getUploadUrl')
+    ensureOk(reply, 'getUploadUrl')
+    const ticket = UploadUrlSchema.parse(reply)
+    return { ...ticket.upload_full_url ? { uploadFullUrl: ticket.upload_full_url } : {},
+      ...ticket.upload_param ? { uploadParam: ticket.upload_param } : {} }
+  }
+  /**
+   * Sends one uploaded image as its own message, the way the references send media: `item_list` carries one item, and a
+   * text the caller wrote travels in a separate send. `mid_size` is the ciphertext size, `encrypt_type` 1.
+   */
+  async sendImage(to: string, contextToken: string, clientId: string, image: OutboundImage): Promise<void> {
+    const reply = await this.post('ilink/bot/sendmessage', { msg: { from_user_id: '', to_user_id: to, client_id: clientId,
+      message_type: 2, message_state: 2, context_token: contextToken, item_list: [{ type: 2, image_item: {
+        media: { encrypt_query_param: image.encryptQueryParam, aes_key: image.aesKeyBase64, encrypt_type: 1 },
+        mid_size: image.ciphertextSize } }] } }, this.timeouts.request, 'sendMessage')
     ensureOk(reply, 'sendMessage')
   }
   /** Returns the typing ticket of one sender; iLink needs it only for the typing indicator, never for sends. */

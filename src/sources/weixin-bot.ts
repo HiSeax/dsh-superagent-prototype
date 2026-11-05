@@ -17,13 +17,15 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import type { OutboundMessage } from '../core/index.ts'
+import type { OutboundAttachment, OutboundMessage } from '../core/index.ts'
 import { KV } from '../kv.ts'
 import { health, type SourceContext } from './host.ts'
 import { DEFAULT_BASE_URL, WeixinApi, fetchQrCode, isAuthError, pollQrStatus, type Fetcher, type QrStatus } from './weixin-api.ts'
 import type { WeixinConfig } from './weixin-config.ts'
 import { loginQr, type LoginQrFiles } from './weixin-qr.ts'
-import { SOURCE, WeixinMessageSchema, weixinTrigger } from './weixin-trigger.ts'
+import { downloadMedia, isImageMime, mediaDirectory, mediaReport, nodeCdnTransport, sniffImage, storeMedia, uploadMedia,
+  MEDIA_IMAGE, type CdnTransport, type StoredMedia } from './weixin-media.ts'
+import { SOURCE, WeixinMessageSchema, inboundImages, weixinTrigger, type WeixinMessage } from './weixin-trigger.ts'
 
 /** Login state of the Source: the saved token, the pending QR scan, or the error that stopped it. */
 export const WEIXIN_LOGIN = 'weixin'
@@ -31,10 +33,14 @@ export const WEIXIN_LOGIN = 'weixin'
 export const WEIXIN_POLL = 'weixin-poll'
 /** Health of replies, including the 24-hour send window. */
 export const WEIXIN_SEND = 'weixin-send'
+/** Health of received media: how many images are stored, and how many are past the retention; nothing is ever deleted. */
+export const WEIXIN_MEDIA = 'weixin-media'
 /** The health entries the kind claims, in display order. */
-export const WEIXIN_HEALTH = [WEIXIN_LOGIN, WEIXIN_POLL, WEIXIN_SEND]
+export const WEIXIN_HEALTH = [WEIXIN_LOGIN, WEIXIN_POLL, WEIXIN_SEND, WEIXIN_MEDIA]
 /** `MessageItem` text is chunked at 4000 characters, the limit CowAgent's Weixin channel sends. */
 const TEXT_CHUNK = 4000
+/** How many images one message may carry in either direction; more are counted as unread and reported, not sent. */
+const MAX_IMAGES = 4
 /** The references refresh an expired QR code at most three times before ending the login attempt. 推定，未验证. */
 const QR_MAX_REFRESHES = 3
 /** A single QR status poll holds about 35 s on the server; the client waits slightly longer, as the references do. */
@@ -56,6 +62,8 @@ export interface WeixinBotOptions {
   qrPollTimeoutMs?: number
   /** The whole QR login lifetime; overrides the configured minutes in tests. */
   qrTimeoutMs?: number
+  /** The CDN transport for media; tests answer uploads and downloads through it instead of a network call. */
+  cdn?: CdnTransport
 }
 const describe = (error: unknown): string => error instanceof Error ? `${error.name}: ${error.message}` : String(error)
 /**
@@ -95,12 +103,14 @@ export class WeixinBot {
   private readonly wait: (ms: number, signal: AbortSignal) => Promise<void>
   private readonly qrPollTimeoutMs: number
   private readonly qrTimeoutMs?: number
+  private readonly cdn: CdnTransport
   constructor(options: WeixinBotOptions = {}) {
     this.fetcher = options.fetcher ?? globalThis.fetch as unknown as Fetcher
     this.clock = options.now ?? (() => Date.now())
     this.wait = options.wait ?? ((ms, signal) => delay(ms, undefined, { signal }).then(() => {}, () => {}))
     this.qrPollTimeoutMs = options.qrPollTimeoutMs ?? QR_STATUS_TIMEOUT
     this.qrTimeoutMs = options.qrTimeoutMs
+    this.cdn = options.cdn ?? nodeCdnTransport
   }
   /** Gives the bot the Source context of the active plugin instance; the entry detaches it when the plugin unloads. */
   attach(context: SourceContext): void { this.context = context }
@@ -115,6 +125,8 @@ export class WeixinBot {
   private credentialsPath(config: WeixinConfig): string {
     return isAbsolute(config.credentials) ? config.credentials : resolve(this.stateDir(), config.credentials)
   }
+  /** The directory received images are stored in; its name and limit are configuration, not constants of the protocol. */
+  private mediaDir(config: WeixinConfig): string { return mediaDirectory(this.stateDir(), config.mediaDir) }
   /** The pending QR files of the last login attempt, for the panel's health detail and tests. */
   qrFiles(): LoginQrFiles | undefined { return this.qr }
   /** Reads the confirmed login; undefined when the file is absent, corrupt or has no token. */
@@ -170,7 +182,9 @@ export class WeixinBot {
     const userId = message.channel.address.userId
     if (!userId) throw new Error('Missing WeChat reply target')
     const text = message.text.trim()
-    if (!text) throw new Error('A WeChat reply needs text')
+    const attachments = message.attachments ?? []
+    if (!text && !attachments.length) throw new Error('A WeChat reply needs text or an image')
+    if (attachments.length > MAX_IMAGES) throw new Error(`A WeChat reply carries at most ${MAX_IMAGES} images`)
     const contextToken = context.state.get(KV.weixin.context(userId))
     if (!contextToken) {
       this.failSend('this person has no context token yet, which iLink stores from their latest message')
@@ -196,8 +210,39 @@ export class WeixinBot {
       }
       context.state.set(KV.weixin.sent(replyId), true)
     }
+    for (const [index, attachment] of attachments.entries()) {
+      // An image travels as its own message, once per message id, as the references send media.
+      const replyId = `${message.id}@image-${index}`
+      if (context.state.get(KV.weixin.sent(replyId))) continue
+      try {
+        await this.sendImage(api, userId, contextToken, attachment, `dsh-superagent-image-${replyId}`)
+      } catch (error) {
+        if (isAuthError(error)) {
+          context.report(WEIXIN_LOGIN, { state: 'error', at: this.stamp(), detail: 'The bot token is stale; scan the QR code again' })
+        }
+        this.failSend(describe(error))
+        throw error
+      }
+      context.state.set(KV.weixin.sent(replyId), true)
+    }
     context.report(WEIXIN_SEND, { state: 'ready', at: this.stamp(), detail: 'The last reply was delivered' })
     return 'sent'
+  }
+  /**
+   * Uploads one local image to the WeChat CDN and sends it as an `image_item`. Only the image types a model reads are
+   * carried, and the configured size limit applies before anything is encrypted or uploaded.
+   */
+  private async sendImage(api: WeixinApi, userId: string, contextToken: string, attachment: OutboundAttachment, clientId: string): Promise<void> {
+    const config = this.config()
+    if (!config) throw new Error('The Weixin Source is not configured')
+    if (attachment.mime && !isImageMime(attachment.mime)) throw new Error(`WeChat cannot carry ${attachment.mime}; only PNG, JPEG, WebP and GIF images are supported`)
+    const data = readFileSync(attachment.path)
+    if (data.length > config.maxMediaBytes) throw new Error(`the image is larger than the Media size limit of ${config.maxMediaBytes} bytes`)
+    const image = sniffImage(data)
+    if (!image) throw new Error(`the file ${attachment.path} is not a PNG, JPEG, WebP or GIF image`)
+    const upload = await uploadMedia(api, this.cdn, { data, toUserId: userId, mediaType: MEDIA_IMAGE, cdnBaseUrl: config.cdnBaseUrl })
+    await api.sendImage(userId, contextToken, clientId, { encryptQueryParam: upload.encryptQueryParam,
+      aesKeyBase64: upload.aesKeyBase64, ciphertextSize: upload.ciphertextSize })
   }
   private failSend(detail: string): void {
     this.context?.report(WEIXIN_SEND, { state: 'error', at: this.stamp(),
@@ -343,10 +388,49 @@ export class WeixinBot {
     if (!message.from_user_id) return
     if (message.context_token) context.state.set(KV.weixin.context(message.from_user_id), message.context_token)
     context.state.set(KV.weixin.inbound(message.from_user_id), this.stamp())
-    const trigger = weixinTrigger(message, this.clock)
+    const images = await this.acceptImages(message)
+    const trigger = weixinTrigger(message, this.clock, images.media, images.unread)
     if (!trigger) return
     this.received += 1
     await context.receive(trigger)
+  }
+  /**
+   * Downloads, decrypts and stores the images of one message before its Trigger is built, so the Trigger can name them and
+   * its assessment can read them. A failure is reported on the media health entry and counted as unread, which keeps the
+   * message (a pure image included) from being dropped silently; the size and count limits apply before decryption.
+   */
+  private async acceptImages(message: WeixinMessage): Promise<{ media: StoredMedia[]; unread: number }> {
+    const refs = inboundImages(message.item_list)
+    const config = this.config()
+    if (!refs.length) return { media: [], unread: 0 }
+    if (!config) return { media: [], unread: refs.length }
+    const directory = this.mediaDir(config)
+    const media: StoredMedia[] = []
+    let unread = Math.max(0, refs.length - MAX_IMAGES)
+    for (const ref of refs.slice(0, MAX_IMAGES)) {
+      try {
+        const download = await downloadMedia(this.cdn, { media: ref, maxBytes: config.maxMediaBytes, cdnBaseUrl: config.cdnBaseUrl })
+        media.push(storeMedia({ directory, data: download.data, maxBytes: config.maxMediaBytes }))
+      } catch (error) {
+        unread += 1
+        this.reportMediaError(describe(error))
+      }
+    }
+    if (media.length) this.reportMedia(config)
+    return { media, unread }
+  }
+  /**
+   * Reports what the media directory holds, and how many files are past the retention. Cleanup is a person's action: this
+   * Source never deletes received files, so the count stays visible instead of the directory growing silently.
+   */
+  private reportMedia(config: WeixinConfig): void {
+    const report = mediaReport({ directory: this.mediaDir(config), retentionMs: config.mediaRetentionDays * 86_400_000, now: this.clock() })
+    this.context?.report(WEIXIN_MEDIA, { state: 'ready', at: this.stamp(), values: {
+      files: String(report.files), bytes: String(report.bytes), stale: String(report.stale), directory: report.directory },
+    detail: `${report.files} received image(s), ${(report.bytes / 1_048_576).toFixed(1)} MiB, in ${report.directory}; ${report.stale} are older than ${config.mediaRetentionDays} days. The Source never deletes them, so clear that directory yourself when it grows.` })
+  }
+  private reportMediaError(detail: string): void {
+    this.context?.report(WEIXIN_MEDIA, { state: 'error', at: this.stamp(), detail: `Could not receive an image: ${detail}` })
   }
   /**
    * The Source's lifecycle: wait for setup, then keep the saved login alive. A stale token starts one controlled QR login;

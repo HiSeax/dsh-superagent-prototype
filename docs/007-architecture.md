@@ -382,12 +382,13 @@ Some generic modules still refer directly to GitHub or Feishu, and the local Ses
 | `src/sources/local-read.ts` | `localThreadContext`: pages a listened Session's history backwards from the Trigger's message for assessments |
 | `src/sources/local-loops.ts` | The local Session Source's intake and health: receives a person's message and labels its Thread, and reports the listened Sessions and any configured one that is missing |
 | `src/sources/weixin.ts` | The Weixin kind and plugin entry, exported as `./weixin-watch`: the iLink Bot of a personal WeChat account, its configuration, scope, Channel and Policy |
-| `src/sources/weixin-api.ts` | The iLink Bot HTTP client, aligned to `@tencent-weixin/openclaw-weixin@2.4.6`: headers and `base_info`, `getUpdates`, `sendMessage`, `getConfig`, `sendTyping`, the lifecycle notices, and the QR login requests |
-| `src/sources/weixin-bot.ts` | The Weixin runtime: the saved login, the QR login state machine, the long-poll loop with its cursor and backoff, and idempotent replies with the 24-hour send-window report |
-| `src/sources/weixin-trigger.ts` | An iLink update as a Trigger: text items, a voice transcription and quoted text, and the drop rules for groups and text-less media |
-| `src/sources/weixin-config.ts` | The Weixin Source's configuration schema and tunables |
+| `src/sources/weixin-api.ts` | The iLink Bot HTTP client, aligned to `@tencent-weixin/openclaw-weixin@2.4.6`: headers and `base_info`, `getUpdates`, `sendMessage`, `getUploadUrl`, the media `image_item` send, `getConfig`, `sendTyping`, the lifecycle notices, and the QR login requests |
+| `src/sources/weixin-bot.ts` | The Weixin runtime: the saved login, the QR login state machine, the long-poll loop with its cursor and backoff, image intake and the media store, and idempotent text and image replies with the 24-hour send-window report |
+| `src/sources/weixin-trigger.ts` | An iLink update as a Trigger: text items, a voice transcription, quoted text, the `image_item` references whose stored file the text names, and the drop rules for groups and unreadable media |
+| `src/sources/weixin-config.ts` | The Weixin Source's configuration schema and tunables, including the media directory, its size limit and retention |
+| `src/sources/weixin-media.ts` | Weixin media: the AES-128-ECB envelope, the legacy-TLS CDN transport (upload and download), the size limit, the content-hashed store under the state directory, and the `[Image: …]` references an assessment reads |
 | `src/sources/weixin-qr.ts` | The login QR URL rendered as a PNG beside the credentials file, with its link text |
-| `src/sources/weixin-read.ts` | The Weixin context reader, which reports `no_history`: the protocol exposes no history read |
+| `src/sources/weixin-read.ts` | The Weixin context reader: `no_history` for the protocol's missing history read, and the Trigger's own stored image committed as an attachment |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
@@ -426,6 +427,7 @@ Some generic modules still refer directly to GitHub or Feishu, and the local Ses
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
 | `tests/local.spec.ts` | The local Session Source: Trigger translation, the main-Session switch and self-loop filtering, the listened-Session scope, the allowed-sender policy, the idempotent Channel, the paged context read, the plugin entry's intake, and `LocalSessions` |
 | `tests/weixin.spec.ts` | The Weixin Source on a fake HTTP transport: Trigger translation, the persisted long-poll cursor and its per-account reset, idempotent sends and their 24-hour window report, chunk retries, the `-14` re-login, poll failure health, the QR login (PNG and link files, saved credentials, an unscanned login), and the honest no-history reader |
+| `tests/weixin-media.spec.ts` | Weixin media on fake CDN and HTTP transports: the AES-128-ECB vector and key encodings, the `getuploadurl` request and ciphertext, the `upload_full_url` and legacy URLs, download and decrypt, the size limits and stored-media dedupe with its report-only cleanup, a pure-image message becoming a Trigger with a stored image, an unreadable picture kept as a Trigger, the image send's ticket and `image_item`, refusal of a non-image attachment, and the stale-token report |
 | `tests/boot-notice.spec.ts` | The host-start self-check: once per host boot and again after a restart, the same id across a reload, the switch, the message text and the watchdog's newest start line |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
