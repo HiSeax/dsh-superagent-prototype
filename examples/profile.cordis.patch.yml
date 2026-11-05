@@ -10,3 +10,7 @@
 # Feishu is optional: uncomment to enable its Source, then set the bot's lark-cli on the Feishu Source.
 # - id: dsh-superagent-feishu
 #   disabled: false
+# The local DSH Session Source is optional: uncomment to enable it and restart, then set the channel Session's id on the
+# Local DSH Session card under Settings > Sources; that save applies without another restart.
+# - id: dsh-superagent-local
+#   disabled: false

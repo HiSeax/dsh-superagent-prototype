@@ -14,7 +14,7 @@ The example assumes this CLI contract:
 - `hookq reply --conversation <id> --to <message id> --key <key> --text <text>` replies under a message, once per key. For a conversation that was deleted it fails with `{"error": {"code": 410, "message": "…"}}` on standard error.
 - `hookq thread --conversation <id> --root <message id> --json`, with `--after <cursor>` for a later page, prints a page of a thread, oldest first: `{"items": […], "next": "<cursor>"}`, without `next` on the last page.
 
-Put the kind and its plugin entry in `src/sources/webhook.ts`, following `src/sources/github.ts`. If the Source grows, split translation, Channel and polling code into separate modules as the Feishu Source does.
+Put the kind and its plugin entry in `src/sources/webhook.ts`, following `src/sources/github.ts`. If the Source grows, split translation, Channel and polling code into separate modules as the Feishu Source does. A Source whose channel is a DSH Session needs no CLI: `src/sources/local.ts` is the smallest in-repo kind, with the Session log as its events and `SourceHost.dshSessions` as its Channel and context reader.
 
 ### 1. Map the events onto the domain
 
@@ -174,7 +174,7 @@ export async function sendWebhook(host: Pick<SourceContext, 'commands'>, message
 }
 ```
 
-- **Idempotent sends.** Outbox calls `SourceRegistry.send`, which invokes `channel.send`. Messages wait while the Source plugin is unloaded. A send may fail after the remote service received it, so retries must not duplicate messages. Use `message.id` as an idempotency key: `hookq` supports `--key`; GitHub stores a hidden comment marker; Feishu accepts an idempotency key.
+- **Idempotent sends.** Outbox calls `SourceRegistry.send`, which invokes `channel.send`. Messages wait while the Source plugin is unloaded. A send may fail after the remote service received it, so retries must not duplicate messages. Use `message.id` as an idempotency key: `hookq` supports `--key`; GitHub stores a hidden comment marker; Feishu accepts an idempotency key; the local Session Source passes it to `SourceHost.dshSessions.deliver`, which deduplicates like this plugin's own deliveries.
 - **Permanent versus retryable failure.** Return `sent` on success and `gone` only when delivery is permanently impossible, such as the example's 410. A gone message is retained as dropped and never queued again; it appears in `GET sources` and on the Source page. Throw for other failures so Outbox retries after 5 seconds, doubling to 300 seconds. `CliError.code` is the code reported by the CLI output.
 - **Allowed destinations.** `allowed(address, config)` checks only the saved address and current configuration. Put every required fact in the address; for example, Feishu records whether the chat is direct. A destination no longer listened to is dropped, while a disabled Source leaves messages waiting. Without `allowed`, all addresses are permitted while the Source is enabled.
 - **Links.** `link(address, links)` returns the URL and label the panel displays through `SourceRegistry.link`.
@@ -421,5 +421,5 @@ it('takes in what the queue holds after the cursor, once, and moves the cursor a
 7. Give it a part of the Policy with `allowed` and the admission rows.
 8. Register its execution environment variables.
 9. Write the plugin entry and a loop that waits for setup, follows the switch, moves cursors after `receive`, keeps errors per item, reports health and stops on abort; name the cursors in `KV`.
-10. Add the build entry, the export and the `cordis.patch.yml` insert, and list the module and its spec in the tables of 007.
+10. Add the build entry, the export and the `cordis.patch.yml` insert, and list the module and its spec in the tables of 007. A Source with no account to check needs no `SETUP_FIELDS` entry: setup probes only GitHub and Feishu.
 11. Test it as `tests/sources.spec.ts` tests the other Sources.

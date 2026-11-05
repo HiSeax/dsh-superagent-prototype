@@ -20,8 +20,37 @@ export type Health = { state: 'starting' | 'ready' | 'paused' | 'error'; detail:
 export function health(state: Health['state'], code: HealthCode, values: Record<string, string> = {}): Health {
   return { state, detail: fill(HEALTH_TEXT[code], values), code, ...Object.keys(values).length ? { values } : {} }
 }
+/** One message read from a DSH Session log for a Source's Thread context. */
+export interface SessionLogMessage {
+  /** The DSH message id, the one a Trigger of that message records as its own message. */
+  id: string
+  /** Log sequence number of the message's event, which anchors a page cursor. */
+  seq: number
+  at: string
+  text: string
+  /** Who wrote it: a person in the Session, its own agent, or another plugin's delivery, such as this plugin's replies. */
+  author: 'person' | 'agent' | 'plugin'
+}
+/** One page of a DSH Session's messages, oldest first; `next` continues to older messages and is absent at the start of the log. */
+export interface SessionLogPage { messages: SessionLogMessage[]; next?: number }
+/**
+ * Host capability for a Source kind that uses a DSH Session as its channel: delivering a reply once per OutboundMessage id,
+ * reading a bounded page of history, and checking that a configured Session exists.
+ */
+export interface SourceSessions {
+  /** Delivers `text` into Session `id` at most once per `requestId` (the OutboundMessage id); `'gone'` when the Session does not exist. */
+  deliver(id: string, requestId: string, text: string, mode: 'queue' | 'steer'): Promise<'sent' | 'gone'>
+  /** Reads up to `limit` messages whose events precede log sequence `before` (exclusive), oldest first. */
+  page(id: string, before: number, limit: number): Promise<SessionLogPage>
+  /** Whether the ordinary Session `id` exists, attached or stored. */
+  exists(id: string): Promise<boolean>
+}
 export interface SourceHost {
   readonly sources: SourceRegistry
+  /** The main Session's id; its messages and the replies this plugin delivers never become Triggers of a local Session Source. */
+  readonly masterId: string
+  /** DSH Sessions for a Source kind that channels one, such as the local Session Source. */
+  readonly dshSessions: SourceSessions
   /** Returns the context for one Source kind; its `report` writes only the health entries declared by the kind. */
   context(kind: { kind: string; health: readonly string[] }): SourceContext
 }

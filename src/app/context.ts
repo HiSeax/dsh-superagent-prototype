@@ -10,8 +10,9 @@ export const workerPrompt = promptFile('worker')
 /** Built-in policy sections referenced by role prompts; a team may override them. */
 export const guides: Readonly<Record<string, string>> = Object.fromEntries(['subscriptions', 'replies', 'dispatch', 'work']
   .map(name => [name, promptFile(name)]))
-/** Bundled Source skills registered by dsh-superagent; a team may override their text. */
-export const sourceSkills: Readonly<Record<'feishu' | 'github', string>> = { feishu: bundledSkills.feishu.content, github: bundledSkills.github.content }
+/** Bundled Source skills registered by dsh-superagent, by kind; a team may override their text. */
+export const sourceSkills: Readonly<Record<string, string>> =
+  Object.fromEntries(Object.entries(bundledSkills).map(([kind, skill]) => [kind, skill.content]))
 export const cliNotes = promptFile('cli')
 /** Default text for the team-editable prompt sections (communication, ticket scope, and PR delivery). */
 export const teamDefaults = {

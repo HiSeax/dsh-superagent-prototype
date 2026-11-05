@@ -32,6 +32,8 @@ const TEXT = {
   'source.feishu': ['飞书', 'Feishu'],
   'source.github': ['GitHub', 'GitHub'],
   'source.github-issue': ['GitHub Issue', 'GitHub Issue'],
+  'source.local': ['本地 DSH 会话', 'Local DSH Session'],
+  'health.local': ['本地会话来源', 'Local Session Source'],
   'health.github': ['GitHub 来源', 'GitHub Source'],
   'health.feishu': ['飞书来源', 'Feishu Source'],
   'health.history': ['飞书补收', 'Feishu recovery'],
