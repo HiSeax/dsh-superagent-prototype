@@ -60,6 +60,7 @@ Each Source's Policy has an admission table. Its rows are receiving scopes:
 - **Feishu:** each configured chat, other chats the bot receives mentions from, and direct messages. Other chats are received only when **其他群** is set to **仅 @** on the Feishu card.
 - **GitHub:** new Issues, new pull requests, comments and the default branch's CI.
 - **Local DSH Session:** the orchestrator's own main Session when it is listened to, and each configured channel Session. Every message there addresses the agent directly, so only its unlisted-addressed cell can be reached; the Source receives no unaddressed messages.
+- **Weixin:** every direct chat with the bot. iLink carries no group messages, and every message addresses the bot directly, so only the unlisted-addressed cell can be reached.
 
 A row has up to three cells. Each cell decides whether a message becomes an explicit request, an inferred candidate or nothing:
 

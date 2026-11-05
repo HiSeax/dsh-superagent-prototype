@@ -65,10 +65,10 @@ The concepts above and their rules are reusable. The Source implementations, the
 
 | Part | In this repository |
 | --- | --- |
-| Source | Feishu: live events, history recovery, polling of subscribed topics. GitHub: notifications, subscribed Issues and pull requests, CI changes, pull requests merged or closed, and, where switched on, every new Issue, pull request and comment in the repository and the default branch's CI. Local DSH Session: the messages a person writes in the orchestrator's own main Session, when listening to it is on, and in other ordinary DSH Sessions configured as channels; one conversation per Session |
+| Source | Feishu: live events, history recovery, polling of subscribed topics. GitHub: notifications, subscribed Issues and pull requests, CI changes, pull requests merged or closed, and, where switched on, every new Issue, pull request and comment in the repository and the default branch's CI. Local DSH Session: the messages a person writes in the orchestrator's own main Session, when listening to it is on, and in other ordinary DSH Sessions configured as channels; one conversation per Session. Weixin: the direct messages a person sends the official iLink Bot of a personal WeChat account |
 | Policy | Assessment rules, and each Source's allowed list, its sync, its bot list and its admission table |
 | Executor | A DSH Executor Session and a directory per Ticket, in an execution environment whose variables the Executor and the Sources register |
-| Channel | Feishu topic replies, GitHub comments and review thread replies, and messages delivered into the main Session or the local DSH Session the request came from |
+| Channel | Feishu topic replies, GitHub comments and review thread replies, messages delivered into the main Session or the local DSH Session the request came from, and messages sent to a WeChat direct chat through its iLink Bot |
 
 ## Glossary
 

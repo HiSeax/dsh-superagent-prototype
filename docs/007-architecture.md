@@ -190,7 +190,7 @@ Registry configuration methods include `kind`, `instances`, `instance`, `validat
 
 Generic code accesses Source behavior through the registry. `send(message, commands)` calls the kind's Channel and returns `sent`, `gone` or `waiting` if the kind is not installed. `link` resolves its Channel link. `threadContext` pairs a kind's reader with its configuration, or returns nothing when the kind has no reader. Invalid stored configuration disables the instance.
 
-Plugins receive `SourceHost`: the registry, the main Session's id, DSH Sessions for a kind that channels one (`dshSessions`), and `context(kind)`. The kind itself uses a narrower `SourceContext`, built by `sourceContextOf` in `src/app/source-context.ts`. The local Session kind is the only kind that uses `dshSessions`: it listens to `session/event`, delivers through it, and reads the listened Session's history through it.
+Plugins receive `SourceHost`: the registry, the main Session's id, DSH Sessions for a kind that channels one (`dshSessions`), and `context(kind)`. The kind itself uses a narrower `SourceContext`, built by `sourceContextOf` in `src/app/source-context.ts`. The local Session kind is the only kind that uses `dshSessions`: it listens to `session/event`, delivers through it, and reads the listened Session's history through it. The Weixin kind needs no host capability beyond `SourceContext`: it speaks the iLink HTTP protocol itself and uses the DSH Session only through the Engine's normal intake and Channel.
 
 That context supplies deployment and commands, setup readiness (`ready`, `configured`, `problem`), configuration, `receive`, `atomic`, and typed `state`. It also exposes Thread reads and metadata writes, Ticket reads and binding/closure commands, Trigger reads, `notify` through Outbox, and `report` for declared health entries.
 
@@ -285,6 +285,7 @@ Some generic modules still refer directly to GitHub or Feishu, and the local Ses
 - Sessions and Prompts register built-in skills only for GitHub and Feishu. Migration converts their schema-10 records.
 - Setup probes only GitHub and Feishu account fields (`SETUP_FIELDS`). Only those Sources receive account setup problems through `SourceContext.problem`; any other Source's settings block runs no account check.
 - `src/app/local-sessions.ts` serves `SourceHost.dshSessions` to the local Session Source: `AgentDelivery` for idempotent replies, `sessionController.page` for bounded history and `sessionPersistence.stat` for existence. It is the only app-side path by which a Source touches a DSH Session.
+- The Weixin Source calls iLink over HTTPS itself (`src/sources/weixin-api.ts`) and renders its login QR with the packaged `qrcode-generator`; no generic module learns about WeChat.
 
 
 ## Modules
@@ -333,6 +334,7 @@ Some generic modules still refer directly to GitHub or Feishu, and the local Ses
 | `src/app/sessions.ts` | Sessions |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/local-sessions.ts` | `LocalSessions`: the host capability for a Source that channels a local DSH Session, delivering once per message id, reading a bounded history page, and reporting existence without activating the agent |
+| `src/app/boot-notice.ts` | The host-start self-check: its fixed message, the boot-derived request id that makes it once per host boot across a plugin reload, and the newest start line of the watchdog log |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
@@ -379,6 +381,13 @@ Some generic modules still refer directly to GitHub or Feishu, and the local Ses
 | `src/sources/local-channel.ts` | The local Session Channel: delivers a reply into the listened Session (steered into the main Session's turn), `sent` or `gone` |
 | `src/sources/local-read.ts` | `localThreadContext`: pages a listened Session's history backwards from the Trigger's message for assessments |
 | `src/sources/local-loops.ts` | The local Session Source's intake and health: receives a person's message and labels its Thread, and reports the listened Sessions and any configured one that is missing |
+| `src/sources/weixin.ts` | The Weixin kind and plugin entry, exported as `./weixin-watch`: the iLink Bot of a personal WeChat account, its configuration, scope, Channel and Policy |
+| `src/sources/weixin-api.ts` | The iLink Bot HTTP client, aligned to `@tencent-weixin/openclaw-weixin@2.4.6`: headers and `base_info`, `getUpdates`, `sendMessage`, `getConfig`, `sendTyping`, the lifecycle notices, and the QR login requests |
+| `src/sources/weixin-bot.ts` | The Weixin runtime: the saved login, the QR login state machine, the long-poll loop with its cursor and backoff, and idempotent replies with the 24-hour send-window report |
+| `src/sources/weixin-trigger.ts` | An iLink update as a Trigger: text items, a voice transcription and quoted text, and the drop rules for groups and text-less media |
+| `src/sources/weixin-config.ts` | The Weixin Source's configuration schema and tunables |
+| `src/sources/weixin-qr.ts` | The login QR URL rendered as a PNG beside the credentials file, with its link text |
+| `src/sources/weixin-read.ts` | The Weixin context reader, which reports `no_history`: the protocol exposes no history read |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
@@ -404,7 +413,7 @@ Some generic modules still refer directly to GitHub or Feishu, and the local Ses
 | `src/client/locales.ts` | All copy in both languages, and the glossary of [001 Domain model](001-domain.md) |
 | `src/client/client.css`, `css.d.ts` | The panel's stylesheet, loaded as text |
 
-`src/sources/github.ts`, `src/sources/feishu.ts` and `src/sources/local.ts` are also the entries of the three Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch`, `./feishu-watch` and `./local-watch`. The bundle's `cordis.patch.yml` inserts the four plugins, with Feishu and the local Session Source disabled.
+`src/sources/github.ts`, `src/sources/feishu.ts`, `src/sources/local.ts` and `src/sources/weixin.ts` are also the entries of the four Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch`, `./feishu-watch`, `./local-watch` and `./weixin-watch`. The bundle's `cordis.patch.yml` inserts the five plugins, with Feishu, the local Session Source and the Weixin Source disabled.
 
 ## Tests
 
@@ -416,6 +425,8 @@ Some generic modules still refer directly to GitHub or Feishu, and the local Ses
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
 | `tests/local.spec.ts` | The local Session Source: Trigger translation, the main-Session switch and self-loop filtering, the listened-Session scope, the allowed-sender policy, the idempotent Channel, the paged context read, the plugin entry's intake, and `LocalSessions` |
+| `tests/weixin.spec.ts` | The Weixin Source on a fake HTTP transport: Trigger translation, the persisted long-poll cursor and its per-account reset, idempotent sends and their 24-hour window report, chunk retries, the `-14` re-login, poll failure health, the QR login (PNG and link files, saved credentials, an unscanned login), and the honest no-history reader |
+| `tests/boot-notice.spec.ts` | The host-start self-check: once per host boot and again after a restart, the same id across a reload, the switch, the message text and the watchdog's newest start line |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |

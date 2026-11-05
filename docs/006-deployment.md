@@ -25,6 +25,7 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 - A repository on github.com; GitHub Enterprise Server is not supported. To create a checkout per Ticket, keep a local clone from which the prepare command can add worktrees. Install `git-lfs` if that repository uses Git LFS.
 - A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
 - For Feishu: `lark-cli` (tested with 1.0.90) and a Feishu or Lark app with a bot
+- For the Weixin Source: a WeChat client 8.0.69 or later to scan its QR code. The Source needs no CLI, app id or secret
 
 ## Accounts
 
@@ -68,6 +69,19 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 
    Both configurations share the keychain entry for the app secret. To remove only the bot configuration, delete its directory; do not run `lark-cli config remove`, which would affect the shared secret.
 
+### WeChat iLink Bot (optional)
+
+The Weixin Source talks to the official iLink Bot protocol of a personal WeChat account; it needs no CLI, app id or secret, only a scan.
+
+1. Enable the `dsh-superagent-weixin` entry in the profile's `cordis.patch.yml` and restart dsh-superagent. The row ships disabled in the bundle.
+2. On the first start the Source asks iLink for a login QR code and writes it beside its credentials file: `<stateDir>/weixin-qrcode.png`, with the link text in `<stateDir>/weixin-qrcode.txt`. Its `weixin` health entry names both paths. The QR expires after a couple of minutes; the Source refreshes it at most three times.
+3. Scan the image with WeChat 8.0.69 or later and confirm on the phone. The login is saved in `<stateDir>/weixin-bot.json` (the **Login credentials file** field, configurable), and the bot appears in the WeChat chat list, where it can be renamed or pinned.
+4. To log in again, point **Login credentials file** at another file and restart dsh-superagent; a stale token (`ret`/`errcode` `-14`) makes the Source move the old file aside (`*.expired-<time>`) and request a new QR by itself.
+5. Add the other side's wxid, which the Trigger shows, to the Weixin allowed list under **Policy**; until then an incoming message is admitted only through the admission table, which ignores by default.
+6. Messages that carry only an image, file, video or untranscribed voice are not received: this Source implements the text path of the protocol only.
+
+**24-hour push limit.** iLink lets the bot push a message only within 24 hours of the person's last message. A Ticket result that comes later cannot be delivered until that person sends the bot another message; the Source reports such a rejected send on its `weixin-send` health entry instead of dropping it silently.
+
 ## Install
 
 Run this block once, on a machine that has no `superagent` profile yet:
@@ -94,6 +108,7 @@ Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) t
 | --- | --- | --- |
 | `stateDir` | yes | Absolute path: the database, the lock, the command shims in `worker-bin`, the agent's git configuration and, by default, the Ticket directories in `work`. Back it up before upgrades |
 | `promptMaxChars`, `admissionContextMaxPages`, `admissionContextTimeoutMs` | no | The largest saved prompt configuration, and how many Thread pages one assessment reads within what time |
+| `bootNotice` | no | Send one self-check message to the main Session after each host start (default `true`). It wakes the main Session to check interrupted work; it starts nothing and changes no state. Read when dsh-superagent starts |
 
 After the first start, edit machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Changes apply without restart. `stateDir` cannot be changed there. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
 
@@ -119,7 +134,7 @@ scripts/dsh-superagent status
 | 2 | It runs, but a part other than the runtime, such as a Source or a Policy sync (`sync:<source id>`), reports an error; a restart does not fix it |
 | 3 | It runs and waits for setup; a restart does not fix it |
 
-A Source that is still starting counts as normal operation. So does a Feishu bot that setup could not check.
+A Source that is still starting counts as normal operation. So does a Feishu bot that setup could not check. A Weixin Source waiting for its QR scan is starting too.
 
 `status` returns failed parts and their details under `errors`, and setup requirements under `setup`. `start` and `restart` print those problems as lines; they exit 1 if the service never comes up. Only an intentional `stop` pauses automatic recovery.
 
@@ -129,6 +144,10 @@ Each profile stores logs and control files under `.artifacts/`:
 - Control files: `control/profiles/<profile>/`, containing the stop marker, lock and process id.
 
 Open the URL printed in the log, then choose **Superagent** in the sidebar.
+
+### Boot self-check
+
+After each host start dsh-superagent sends the main Session one short self-check message: when the host started, a reminder to check unfinished Tickets and interrupted Sessions, and the newest line of the desktop watchdog's log (`<DSH_HOME>/daemon/desktop-watchdog.log`, or `DSH_SUPERAGENT_WATCHDOG_LOG`) when it can be read. It only wakes the main Session; it starts no work and changes no state. A plugin hot reload in the same host process does not deliver it twice, because its id comes from the host's start instant. Set the `bootNotice` machine setting to `false` to switch it off.
 
 ### Hourly check
 
@@ -144,7 +163,7 @@ Check dsh-superagent: run `scripts/dsh-superagent --profile superagent status` i
 
 Setup must succeed before polling or work starts. Overview lists missing requirements and links to their settings. A settings change runs setup again. If you fix something outside the application, such as CLI authentication, choose **Check again**.
 
-1. **Sources.** Set the GitHub repository (`owner/name`) and agent CLI, for example `/home/me/.local/bin/gh-agent`. Requests normally arrive through the agent account's notifications. A new Issue or comment mentioning the account arrives on the next poll; adding a mention by editing an existing Issue body does not. Post a new comment instead. For Feishu, set the bot CLI, chats, each chat's receive-all or mentions-only mode, and whether to receive direct messages. For the local Session Source, switch on **监听编排器主会话** to treat a person's messages in the main Session as requests, and optionally list the session ids of other ordinary DSH Sessions to use as channels; the fields' hints name them. The Source needs no CLI or account check, and a save applies at once without a restart.
+1. **Sources.** Set the GitHub repository (`owner/name`) and agent CLI, for example `/home/me/.local/bin/gh-agent`. Requests normally arrive through the agent account's notifications. A new Issue or comment mentioning the account arrives on the next poll; adding a mention by editing an existing Issue body does not. Post a new comment instead. For Feishu, set the bot CLI, chats, each chat's receive-all or mentions-only mode, and whether to receive direct messages. For the local Session Source, switch on **监听编排器主会话** to treat a person's messages in the main Session as requests, and optionally list the session ids of other ordinary DSH Sessions to use as channels; the fields' hints name them. The Source needs no CLI or account check, and a save applies at once without a restart. The Weixin Source needs no CLI either: its first start requests the QR code described under WeChat iLink Bot above.
 2. **Policy.** The two example rules can be edited or removed. Under **On each Source**, add the GitHub accounts and Feishu users who may ask for work; until a list has someone, no request can become a Ticket. With Feishu, a chat can be chosen to sync the list from, at startup and on **Sync now**.
 3. **Execution.** The directory root and a prepare command. To give each Ticket a checkout of the repository:
 
@@ -189,6 +208,9 @@ Health entries are grouped by responsibility:
 | `worker` | Executor Session event handling; appears after its first failure |
 | `github`, `feishu`, `history` | Source polling, events and history recovery |
 | `local` | The local Session Source: the main Session when it is listened to, and whether every configured channel Session exists |
+| `weixin` | The Weixin Source's login: the pending QR scan (naming the image and link files), a saved login, or a stale token |
+| `weixin-poll` | The Weixin long poll: listening, or how many polls in a row failed |
+| `weixin-send` | Weixin replies, including a send rejected because the 24-hour push window closed |
 | `sync:<source id>` | Allowed-list synchronization |
 
 A refusal has a status and `error`, its English text:
@@ -200,7 +222,7 @@ A refusal has a status and `error`, its English text:
 
 The blocks:
 
-- `source:github`, `source:feishu`, `source:local`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository` and `cli`, and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`; the local Session Source's has `master` (whether the orchestrator's own main Session is listened to), `sessions` as `[{"sessionId": "session-…", "name": "…"}]` (other ordinary DSH Sessions it uses as channels, configured by Session id) and `readPageSize`.
+- `source:github`, `source:feishu`, `source:local`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository` and `cli`, and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`; the local Session Source's has `master` (whether the orchestrator's own main Session is listened to), `sessions` as `[{"sessionId": "session-…", "name": "…"}]` (other ordinary DSH Sessions it uses as channels, configured by Session id) and `readPageSize`; the Weixin Source's has `credentials` (the login file, default `weixin-bot.json`), `baseUrl`, `requestTimeoutMs`, `longPollTimeoutMs` and `qrTimeoutMinutes`.
 - `policy`: `{"rules": […], "sources": {"github": {"allowed": [{"id": "<login>"}], "bots": [{"id": "dependabot[bot]"}]}, "feishu": {"allowed": [{"id": "ou_…", "name": "…"}], "syncChat": "oc_…", "admission": {"oc_…": {"unlistedAddressed": "explicit"}}}}}`. `bots` lists the bots whose messages may become inferred candidates. An `admission` row is keyed by chat id, `other` or `direct` for Feishu, and by `issues`, `pulls`, `comments` or `ci` for GitHub; an unset cell takes its default (see [002 Authorization](002-authorization.md)).
 - `eval`: `mode`, `timeoutSeconds` and `model`.
 - `executor`: `model`, `maxWorkers`, `directory`, `prepare` and `blockedCommands`. The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.
@@ -218,7 +240,7 @@ curl -s -X PUT -H 'x-orchestrator-request: 1' -H 'content-type: application/json
 
 Setup uses the DeepSeek Harness subprocess service, as worker shells do. It removes environment variables whose names contain KEY, PASSWORD, SECRET or TOKEN.
 
-Setup verifies the GitHub repository and the agent's push access, writes the worker environment, and checks that git uses only the agent credentials for github.com. A Feishu setup failure disables only the Feishu Source. The local Session Source has no account to check; it reports which Sessions it listens to and whether any configured channel Session is missing.
+Setup verifies the GitHub repository and the agent's push access, writes the worker environment, and checks that git uses only the agent credentials for github.com. A Feishu setup failure disables only the Feishu Source. The local Session Source has no account to check; it reports which Sessions it listens to and whether any configured channel Session is missing. The Weixin Source has no account to check either: it logs in with a QR scan and reports that on its own health entries.
 
 The process environment that setup writes:
 
