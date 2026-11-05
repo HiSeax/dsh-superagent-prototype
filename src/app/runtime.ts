@@ -15,6 +15,7 @@ import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
 import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
+import { deliverBootNotice, hostBootAt, lastBootLine, watchdogLog } from './boot-notice.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
 import type { Deployment, Machine } from '../deployment.ts'
@@ -98,6 +99,10 @@ export class Runtime extends Service implements SourceHost {
   private readonly board = new HealthBoard()
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
   readonly masterId: string
+  /** The instant this host process started; the self-check message is idempotent per boot. */
+  readonly bootAt: Date = hostBootAt()
+  /** Whether the host-start self-check is delivered; the plugin entry sets it from its configuration. */
+  private readonly bootNotice: boolean = false
   /** DSH Sessions a Source kind may channel, such as the local Session Source. */
   readonly dshSessions: SourceSessions
   private readonly sourceLinks = new TextCache(200_000)
@@ -110,8 +115,9 @@ export class Runtime extends Service implements SourceHost {
   private readonly toolHost: MainToolsHost & ExecutorToolsHost
   /** Non-zero while a main-Session tool is executing an Engine command, suppressing self-triggered domain event notices. */
   private quiet = 0
-  constructor(ctx: Context, readonly machine: Machine, restart: () => void) {
+  constructor(ctx: Context, readonly machine: Machine, restart: () => void, options: { bootNotice?: boolean } = {}) {
     super(ctx, 'orchestrator')
+    this.bootNotice = options.bootNotice ?? false
     const runtime = this
     // Lock the state directory before opening the database so another process cannot migrate or write concurrently.
     mkdirSync(machine.stateDir, { recursive: true, mode: 0o700 })
@@ -241,7 +247,17 @@ export class Runtime extends Service implements SourceHost {
     this.executor.resume()
     this.passes.start()
     this.effects.start()
+    await this.announceBoot().catch(error => { this.ctx.logger.warn('dsh-superagent could not deliver its boot self-check: %s', String(error)) })
     this.runtimeHealth.set({ state: 'ready', detail: 'Orchestrator is ready', at: now() })
+  }
+  /**
+   * Queues the host-start self-check for the main Session once per host boot. The relay is durable, and the request id
+   * comes from the boot instant, so a hot reload re-queues the same id and AgentDelivery drops the duplicate.
+   */
+  private async announceBoot(): Promise<void> {
+    if (!this.bootNotice) return
+    await deliverBootNotice({ enabled: true, masterId: this.masterId, bootAt: this.bootAt, watchdog: lastBootLine(watchdogLog()),
+      deliver: (requestId, text) => { this.sessions.relay(requestId, text) } })
   }
   private httpHost(): HttpHost {
     const runtime = this

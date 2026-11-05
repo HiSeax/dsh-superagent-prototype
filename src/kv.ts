@@ -52,6 +52,17 @@ export const KV = {
    * Feishu Source: known chats (`true` for direct messages); per-chat history cursor and active topics mapped from topic ID
    * to last-seen timestamp; and per-polled-thread seen message IDs and initialization flag.
    */
+  /**
+   * Weixin (iLink Bot): the long-poll cursor and the bot account it was read for, per-sender context tokens (iLink
+   * requires every send to echo the token of that sender's latest inbound message), reply ids already delivered, and the
+   * time of each sender's latest inbound message, which opens the 24-hour proactive-send window.
+   */
+  weixin: {
+    cursor: record<{ botId: string; buf: string }>('weixin-updates'),
+    context: family<string, [user: string]>('weixin-context:'),
+    sent: family<boolean, [reply: string]>('weixin-sent:'),
+    inbound: family<string, [user: string]>('weixin-inbound:'),
+  },
   feishu: { chats: record<Record<string, boolean>>('feishu-chats'), history: family<string, [chat: string]>('feishu-history:'),
     topics: family<Record<string, string>, [chat: string]>('feishu-history-threads:'),
     seen: family<string[], [thread: string]>('thread-seen:'), initialized: family<boolean, [thread: string]>('thread-initialized:') },

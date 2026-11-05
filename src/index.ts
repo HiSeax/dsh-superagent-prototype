@@ -20,7 +20,7 @@ export async function apply(ctx: Context, config: DeploymentConfig): Promise<voi
   }
   // A killed previous host keeps its lock for proper-lockfile's stale window; wait it out so a fast restart still activates.
   await waitForStateLock(machine.stateDir)
-  const runtime = new Runtime(ctx, machine, restart)
+  const runtime = new Runtime(ctx, machine, restart, { bootNotice: config.bootNotice })
   ctx.effect(() => async () => { await runtime.stop() })
   await runtime.ready
   ctx.logger.info(runtime.configured() ? 'dsh-superagent ready; the Superagent sidebar entry opens the management panel' : `dsh-superagent is waiting for setup: ${runtime.setupProblem?.detail ?? ''}`)
