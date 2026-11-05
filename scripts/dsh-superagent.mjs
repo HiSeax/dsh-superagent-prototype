@@ -80,7 +80,9 @@ function serviceEnv() {
 
 /** Parse the version of a DSH entry point, or undefined when it cannot be read. */
 function dshVersion(dsh) {
-  const result = spawnSync(dsh, ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 20_000, shell: /\.(cmd|bat)$/i.test(dsh) })
+  // `shell: true` cannot quote an argument list itself, and the DSH entry point usually sits under a path with spaces.
+  const command = /\.(cmd|bat)$/i.test(dsh) ? `"${dsh}"` : dsh
+  const result = spawnSync(command, ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 20_000, shell: /\.(cmd|bat)$/i.test(dsh) })
   const match = /(\d+)\.(\d+)\.(\d+)/.exec(String(result.stdout ?? '') + String(result.stderr ?? ''))
   return match ? match.slice(1).map(Number) : undefined
 }
@@ -245,7 +247,7 @@ async function start(args) {
     const argv = ['--profile', args.profile, '--no-open']
     const file = openSync(log, 'a')
     let child
-    if (/\.(cmd|bat)$/i.test(dsh)) child = spawn(dsh, argv, { cwd: ROOT, env, detached: true, windowsHide: true, stdio: ['ignore', file, file], shell: true })
+    if (/\.(cmd|bat)$/i.test(dsh)) child = spawn(`"${dsh}"`, argv, { cwd: ROOT, env, detached: true, windowsHide: true, stdio: ['ignore', file, file], shell: true })
     else if (/\.(c|m)?js$/i.test(dsh)) child = spawn(process.execPath, [dsh, ...argv], { cwd: ROOT, env, detached: true, windowsHide: true, stdio: ['ignore', file, file] })
     else child = spawn(dsh, argv, { cwd: ROOT, env, detached: true, windowsHide: true, stdio: ['ignore', file, file] })
     child.unref()
