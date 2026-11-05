@@ -466,6 +466,7 @@ const TEXT = {
   'promptPart.runtime/handoff/worker': ['工单交付与人工确认（执行器）', 'Ticket handoff and human confirmation (Executor)'],
   'promptPart.runtime/policy/none': ['策略（没有启用的规则时）', 'Policy (when no rule is enabled)'],
   'promptPart.skill/feishu': ['飞书技能', 'Feishu skill'],
+  'promptPart.skill/weixin': ['微信渠道约定（iLink Bot）', 'WeChat channel rules (iLink Bot)'],
   'promptPart.skill/github': ['GitHub 技能', 'GitHub skill'],
   'promptPart.runtime/environment': ['执行环境', 'Execution environment'],
   promptViewEdit: ['编辑', 'Edit'],
