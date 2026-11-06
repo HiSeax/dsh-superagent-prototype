@@ -4,7 +4,7 @@
  * inbound and outbound paths through the bot's own poll and send loops.
  */
 import { createCipheriv, createHash } from 'node:crypto'
-import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -15,9 +15,9 @@ import type { FetchResponse, Fetcher, UploadUrlRequest } from '../src/sources/we
 import { WEIXIN_LOGIN, WEIXIN_MEDIA, WEIXIN_SEND, WeixinBot } from '../src/sources/weixin-bot.ts'
 import { WeixinConfigSchema, type WeixinConfig } from '../src/sources/weixin-config.ts'
 import { weixinThreadContext } from '../src/sources/weixin-read.ts'
-import { SOURCE, UNREAD_MEDIA } from '../src/sources/weixin-trigger.ts'
-import { decryptMedia, downloadMedia, encryptMedia, mediaKeys, mediaKeyField, mediaReport, paddedMediaSize, resolveMediaKey,
-  sniffImage, storeMedia, uploadMedia, type CdnResponse, type CdnTransport } from '../src/sources/weixin-media.ts'
+import { SOURCE, inboundImages, mediaFailureMarker } from '../src/sources/weixin-trigger.ts'
+import { decryptMedia, downloadMedia, encryptMedia, mediaFailureText, mediaKeys, mediaKeyField, mediaReport, paddedMediaSize,
+  resolveMediaKey, sniffImage, storeMedia, uploadMedia, WeixinMediaError, type CdnResponse, type CdnTransport } from '../src/sources/weixin-media.ts'
 
 const CONFIG: WeixinConfig = WeixinConfigSchema.parse({})
 const NOW = Date.parse('2026-11-06T01:00:00Z')
@@ -86,6 +86,29 @@ describe('weixin media envelope', () => {
     expect(resolveMediaKey(Buffer.from(raw.toString('hex')).toString('base64'))).toEqual(raw)
     expect(mediaKeyField(raw)).toBe(Buffer.from(raw.toString('hex')).toString('base64'))
     expect(() => resolveMediaKey('definitely-not-a-key')).toThrow('media key')
+  })
+  it('names the stage of a media failure for the Trigger text', () => {
+    expect(mediaFailureText(new WeixinMediaError('http', 'x', 403))).toBe('HTTP 403')
+    expect(mediaFailureText(new WeixinMediaError('no-key', 'x'))).toBe('缺少 aes_key')
+    expect(mediaFailureText(new WeixinMediaError('bad-key', 'x'))).toBe('aes_key 解码')
+    expect(mediaFailureText(new WeixinMediaError('too-large', 'x'))).toBe('超过大小上限')
+    expect(mediaFailureText(new WeixinMediaError('tls', 'x'))).toBe('CDN TLS')
+    expect(mediaFailureText(new Error('boom'))).toBe('未知错误')
+  })
+  it('reads the AES key where both references do: image_item.aeskey first, then media.aes_key, empty as absent', () => {
+    const hex = '00112233445566778899aabbccddeeff'
+    // The real-world shape: an empty media.aes_key must not shadow the item's hex key.
+    expect(inboundImages([{ type: 2, image_item: { aeskey: hex, media: { encrypt_query_param: 'p', aes_key: '' } } }]))
+      .toEqual([{ encryptQueryParam: 'p', aesKey: hex, aesKeySource: 'image_item.aeskey' }])
+    const base64Raw = Buffer.from(hex, 'hex').toString('base64')
+    expect(inboundImages([{ type: 2, image_item: { media: { encrypt_query_param: 'p', aes_key: base64Raw } } }])[0]!.aesKey).toBe(base64Raw)
+    expect(inboundImages([{ type: 2, image_item: { media: { full_url: 'https://cdn.example.test/x', aes_key: base64Raw } } }])[0])
+      .toEqual({ fullUrl: 'https://cdn.example.test/x', aesKey: base64Raw, aesKeySource: 'media.aes_key' })
+    // protobuf JSON sends unset fields as null; that must not drop the item.
+    expect(inboundImages([{ type: 2, image_item: { aeskey: null, media: { encrypt_query_param: 'p', aes_key: null } } }]))
+      .toEqual([{ encryptQueryParam: 'p' }])
+    expect(inboundImages([{ type: 2, image_item: {} }])).toEqual([{}])
+    expect(inboundImages([{ type: 1, text_item: { text: 'hi' } }])).toEqual([])
   })
   it('sniffs only the image types a model reads', () => {
     expect(sniffImage(jpeg())).toEqual({ mime: 'image/jpeg', ext: '.jpg' })
@@ -221,9 +244,129 @@ describe('weixin bot media', () => {
     const bot = botOf(fetcher, { cdn: media.cdn })
     bot.attach(context); expect(bot.connect()).toBe(true)
     await bot.poll(controller.signal)
-    expect(received.map(item => item.text)).toEqual([UNREAD_MEDIA])
+    expect(received.map(item => item.text)).toEqual([mediaFailureMarker('HTTP 502')])
     expect(reports[WEIXIN_MEDIA]).toMatchObject({ state: 'error' })
     expect(String(reports[WEIXIN_MEDIA]!.detail)).toContain('HTTP 502')
+  })
+  it('names the stage on the Trigger and logs the message and URL origin when the CDN refuses the image', async () => {
+    const directory = directoryOf(); saveLogin(directory)
+    const reports: Record<string, Health> = {}, received: Trigger[] = [], logs: string[] = []
+    const { context } = host(directory, reports, received)
+    const raw = Buffer.alloc(16, 9)
+    const media = cdn(() => ({ status: 403, headers: {}, body: Buffer.from('forbidden') }))
+    const message = { message_id: 'm-403', from_user_id: 'wxid_alice', context_token: 'ctx-1', item_list: [{ type: 2, image_item: {
+      aeskey: raw.toString('hex'), media: { encrypt_query_param: 'secret-param', full_url: 'https://cdn.example.test/c2c/download?x=1' } } }] }
+    const controller = new AbortController()
+    let polls = 0
+    const { fetcher } = transport(() => {
+      polls += 1
+      if (polls === 2) controller.abort()
+      return { body: { ret: 0, msgs: polls === 1 ? [message] : [] } }
+    })
+    const bot = botOf(fetcher, { cdn: media.cdn, log: line => logs.push(line) })
+    bot.attach(context); expect(bot.connect()).toBe(true)
+    await bot.poll(controller.signal)
+    expect(received[0]!.text).toBe('[图片: 获取失败 HTTP 403]')
+    expect(String(reports[WEIXIN_MEDIA]!.detail)).toContain('HTTP 403')
+    // Nothing was written for a failed download, which is why the media directory stays absent.
+    expect(existsSync(join(directory, 'weixin-media'))).toBe(false)
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toContain('message=m-403')
+    expect(logs[0]).toContain('https://cdn.example.test/c2c/download')
+    expect(logs[0]).toContain('HTTP 403')
+    expect(logs[0]).toContain('aeskey=image_item.aeskey keyLength=32')
+    // The encrypted parameter is never logged, only the URL's origin and path.
+    expect(logs[0]).not.toContain('secret-param')
+    expect(logs[0]).not.toContain('x=1')
+  })
+  it('downloads with image_item.aeskey first and with media.aes_key in either encoding, and builds the legacy URL', async () => {
+    const directory = directoryOf(); saveLogin(directory)
+    const reports: Record<string, Health> = {}, received: Trigger[] = []
+    const { context } = host(directory, reports, received)
+    const raw = Buffer.alloc(16, 5), image = jpeg(72), ciphertext = encryptWith(image, raw.toString('hex'))
+    const hex = raw.toString('hex')
+    const base64Raw = raw.toString('base64'), base64Hex = Buffer.from(hex).toString('base64')
+    const media = cdn(url => {
+      expect(url.startsWith('https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=param-')).toBe(true)
+      return { status: 200, headers: {}, body: ciphertext }
+    })
+    const messages = [
+      // The item's hex key with an empty media.aes_key: the empty value must not shadow it.
+      { message_id: 'm-hex', item_list: [{ type: 2, image_item: { aeskey: hex, media: { encrypt_query_param: 'param-1', aes_key: '' } } }] },
+      { message_id: 'm-b64-hex', item_list: [{ type: 2, image_item: { media: { encrypt_query_param: 'param-2', aes_key: base64Hex } } }] },
+      { message_id: 'm-b64-raw', item_list: [{ type: 2, image_item: { media: { encrypt_query_param: 'param-3', aes_key: base64Raw } } }] },
+    ].map(item => ({ from_user_id: 'wxid_alice', context_token: 'ctx-1', ...item }))
+    const controller = new AbortController()
+    let polls = 0
+    const { fetcher } = transport(() => {
+      polls += 1
+      if (polls === 2) controller.abort()
+      return { body: { ret: 0, msgs: polls === 1 ? messages : [] } }
+    })
+    const bot = botOf(fetcher, { cdn: media.cdn })
+    bot.attach(context); expect(bot.connect()).toBe(true)
+    await bot.poll(controller.signal)
+    expect(received).toHaveLength(3)
+    for (const trigger of received) expect(trigger.text).toMatch(/^\[Image: weixin-[0-9a-f]{32}\.jpg\]$/)
+    expect(new Set(received.map(trigger => trigger.text)).size).toBe(1)
+    expect(reports[WEIXIN_MEDIA]).toMatchObject({ state: 'ready', values: { files: '1' } })
+    const stored = (received[0]!.meta as { images: { path: string }[] }).images[0]!.path
+    expect(readFileSync(stored)).toEqual(image)
+    expect(media.calls.map(call => call.url)).toEqual([1, 2, 3].map(index =>
+      `https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=param-${index}`))
+    // A full_url is preferred when present, as the official plugin does.
+    expect(inboundImages([{ type: 2, image_item: { media: { encrypt_query_param: 'p', full_url: 'https://cdn.example.test/x', aes_key: base64Raw } } }])[0]!.fullUrl)
+      .toBe('https://cdn.example.test/x')
+  })
+  it('names a missing or malformed AES key on the Trigger without touching the CDN', async () => {
+    const directory = directoryOf(); saveLogin(directory)
+    const reports: Record<string, Health> = {}, received: Trigger[] = []
+    const { context } = host(directory, reports, received)
+    const media = cdn(() => ({ status: 200, headers: {}, body: Buffer.alloc(0) }))
+    const messages = [
+      { message_id: 'm-nokey', from_user_id: 'wxid_alice', context_token: 'ctx-1', item_list: [{ type: 2, image_item: { media: { encrypt_query_param: 'p' } } }] },
+      { message_id: 'm-badkey', from_user_id: 'wxid_alice', context_token: 'ctx-1', item_list: [{ type: 2, image_item: { media: { encrypt_query_param: 'p', aes_key: 'definitely-not-a-key' } } }] },
+    ]
+    const controller = new AbortController()
+    let polls = 0
+    const { fetcher } = transport(() => {
+      polls += 1
+      if (polls === 2) controller.abort()
+      return { body: { ret: 0, msgs: polls === 1 ? messages : [] } }
+    })
+    const bot = botOf(fetcher, { cdn: media.cdn })
+    bot.attach(context); expect(bot.connect()).toBe(true)
+    await bot.poll(controller.signal)
+    expect(received.map(item => item.text)).toEqual([mediaFailureMarker('缺少 aes_key'), mediaFailureMarker('aes_key 解码')])
+    expect(media.calls).toHaveLength(0)
+    expect(reports[WEIXIN_MEDIA]).toMatchObject({ state: 'error' })
+  })
+  it('keeps the failure reason on the health entry even when another image of the batch arrived', async () => {
+    const directory = directoryOf(); saveLogin(directory)
+    const reports: Record<string, Health> = {}, received: Trigger[] = []
+    const { context } = host(directory, reports, received)
+    const raw = Buffer.alloc(16, 11), image = jpeg(40)
+    const media = cdn(url => url.includes('param-ok')
+      ? { status: 200, headers: {}, body: encryptWith(image, raw.toString('hex')) }
+      : { status: 403, headers: {}, body: Buffer.from('forbidden') })
+    const messages = ['param-ok', 'param-refused'].map((param, index) => ({ message_id: `m-${index}`, from_user_id: 'wxid_alice',
+      context_token: 'ctx-1', item_list: [{ type: 2, image_item: { aeskey: raw.toString('hex'), media: { encrypt_query_param: param } } }] }))
+    const controller = new AbortController()
+    let polls = 0
+    const { fetcher } = transport(() => {
+      polls += 1
+      if (polls === 2) controller.abort()
+      return { body: { ret: 0, msgs: polls === 1 ? messages : [] } }
+    })
+    const bot = botOf(fetcher, { cdn: media.cdn })
+    bot.attach(context); expect(bot.connect()).toBe(true)
+    await bot.poll(controller.signal)
+    expect(received).toHaveLength(2)
+    expect(received[0]!.text).toMatch(/^\[Image: weixin-/)
+    expect(received[1]!.text).toBe('[图片: 获取失败 HTTP 403]')
+    expect(reports[WEIXIN_MEDIA]).toMatchObject({ state: 'error' })
+    expect(String(reports[WEIXIN_MEDIA]!.detail)).toContain('HTTP 403')
+    expect(readdirSync(join(directory, 'weixin-media'))).toHaveLength(1)
   })
   it('sends an image beside the text: ticket, upload, then an image_item send, each once', async () => {
     const directory = directoryOf(); saveLogin(directory)

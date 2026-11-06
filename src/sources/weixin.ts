@@ -98,7 +98,9 @@ export const inject = ['orchestrator']
  */
 export function apply(ctx: Context): void {
   const host = ctx.orchestrator
-  const bot = new WeixinBot()
+  // Media failures are warnings, not Source-health failures of their own: the Trigger text and the media health entry
+  // already say what happened, and the logger keeps the message id and the CDN origin for a person debugging a picture.
+  const bot = new WeixinBot({ log: line => ctx.logger.warn('dsh-superagent weixin: %s', line) })
   const kind = weixinKind(bot)
   ctx.effect(() => host.sources.register(kind), 'weixin: source kind')
   ctx.effect(() => {
