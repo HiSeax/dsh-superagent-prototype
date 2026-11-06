@@ -23,8 +23,8 @@ import { health, type SourceContext } from './host.ts'
 import { DEFAULT_BASE_URL, WeixinApi, fetchQrCode, isAuthError, pollQrStatus, type Fetcher, type QrStatus } from './weixin-api.ts'
 import type { WeixinConfig } from './weixin-config.ts'
 import { loginQr, type LoginQrFiles } from './weixin-qr.ts'
-import { downloadMedia, isImageMime, mediaDirectory, mediaReport, nodeCdnTransport, sniffImage, storeMedia, uploadMedia,
-  MEDIA_IMAGE, type CdnTransport, type StoredMedia } from './weixin-media.ts'
+import { downloadMedia, isImageMime, mediaDirectory, mediaFailureText, mediaReport, mediaUrlLabel, nodeCdnTransport, sniffImage,
+  storeMedia, uploadMedia, MEDIA_IMAGE, type CdnTransport, type StoredMedia } from './weixin-media.ts'
 import { SOURCE, WeixinMessageSchema, inboundImages, weixinTrigger, type WeixinMessage } from './weixin-trigger.ts'
 
 /** Login state of the Source: the saved token, the pending QR scan, or the error that stopped it. */
@@ -64,6 +64,8 @@ export interface WeixinBotOptions {
   qrTimeoutMs?: number
   /** The CDN transport for media; tests answer uploads and downloads through it instead of a network call. */
   cdn?: CdnTransport
+  /** A warning sink for media failures, such as the plugin's logger; the line names the message and never a CDN token. */
+  log?: (line: string) => void
 }
 const describe = (error: unknown): string => error instanceof Error ? `${error.name}: ${error.message}` : String(error)
 /**
@@ -104,6 +106,7 @@ export class WeixinBot {
   private readonly qrPollTimeoutMs: number
   private readonly qrTimeoutMs?: number
   private readonly cdn: CdnTransport
+  private readonly log: (line: string) => void
   constructor(options: WeixinBotOptions = {}) {
     this.fetcher = options.fetcher ?? globalThis.fetch as unknown as Fetcher
     this.clock = options.now ?? (() => Date.now())
@@ -111,6 +114,7 @@ export class WeixinBot {
     this.qrPollTimeoutMs = options.qrPollTimeoutMs ?? QR_STATUS_TIMEOUT
     this.qrTimeoutMs = options.qrTimeoutMs
     this.cdn = options.cdn ?? nodeCdnTransport
+    this.log = options.log ?? (() => {})
   }
   /** Gives the bot the Source context of the active plugin instance; the entry detaches it when the plugin unloads. */
   attach(context: SourceContext): void { this.context = context }
@@ -389,35 +393,44 @@ export class WeixinBot {
     if (message.context_token) context.state.set(KV.weixin.context(message.from_user_id), message.context_token)
     context.state.set(KV.weixin.inbound(message.from_user_id), this.stamp())
     const images = await this.acceptImages(message)
-    const trigger = weixinTrigger(message, this.clock, images.media, images.unread)
+    const trigger = weixinTrigger(message, this.clock, images.media, images.failures)
     if (!trigger) return
     this.received += 1
     await context.receive(trigger)
   }
   /**
    * Downloads, decrypts and stores the images of one message before its Trigger is built, so the Trigger can name them and
-   * its assessment can read them. A failure is reported on the media health entry and counted as unread, which keeps the
-   * message (a pure image included) from being dropped silently; the size and count limits apply before decryption.
+   * its assessment can read them. A failure is turned into a short stage name that the Trigger text carries
+   * (`[图片: 获取失败 HTTP 403]`), reported on the media health entry, and logged with the message id and the URL's origin
+   * only — never the encrypted query parameter. The size and count limits apply before anything is decrypted or written.
    */
-  private async acceptImages(message: WeixinMessage): Promise<{ media: StoredMedia[]; unread: number }> {
+  private async acceptImages(message: WeixinMessage): Promise<{ media: StoredMedia[]; failures: string[] }> {
     const refs = inboundImages(message.item_list)
     const config = this.config()
-    if (!refs.length) return { media: [], unread: 0 }
-    if (!config) return { media: [], unread: refs.length }
+    if (!refs.length) return { media: [], failures: [] }
+    if (!config) return { media: [], failures: refs.map(() => '来源未配置') }
     const directory = this.mediaDir(config)
     const media: StoredMedia[] = []
-    let unread = Math.max(0, refs.length - MAX_IMAGES)
+    const failures: string[] = refs.slice(MAX_IMAGES).map(() => '数量超出上限')
+    const details = failures.map(reason => `${reason}: more than ${MAX_IMAGES} images in one message`)
+    const messageId = String(message.message_id ?? message.seq ?? '(无 id)')
     for (const ref of refs.slice(0, MAX_IMAGES)) {
       try {
         const download = await downloadMedia(this.cdn, { media: ref, maxBytes: config.maxMediaBytes, cdnBaseUrl: config.cdnBaseUrl })
         media.push(storeMedia({ directory, data: download.data, maxBytes: config.maxMediaBytes }))
       } catch (error) {
-        unread += 1
-        this.reportMediaError(describe(error))
+        const reason = mediaFailureText(error)
+        failures.push(reason)
+        details.push(`${reason}: ${describe(error)}`)
+        // The key itself is never logged; its source and length are enough to tell a wrong field from a wrong encoding.
+        this.log(`image failed message=${messageId} url=${mediaUrlLabel(ref)} aeskey=${ref.aesKeySource ?? 'none'} keyLength=${ref.aesKey?.length ?? 0} reason=${reason}: ${describe(error)}`)
       }
     }
+    // A success report says what the store holds; a failure report comes after it, so the entry keeps the reason a
+    // person debugging the picture needs instead of being replaced by a later "ready".
     if (media.length) this.reportMedia(config)
-    return { media, unread }
+    if (details.length) this.reportMediaError(details.join('; '))
+    return { media, failures }
   }
   /**
    * Reports what the media directory holds, and how many files are past the retention. Cleanup is a person's action: this

@@ -19,15 +19,17 @@ export const SOURCE = 'weixin'
 export const DIRECT_ROW = 'direct'
 /** `MessageItem.type` values: text, image, voice, file and video; media has a read path only for images. */
 const ITEM_TEXT = 1, ITEM_IMAGE = 2, ITEM_VOICE = 3, ITEM_FILE = 4, ITEM_VIDEO = 5
-const TextItemSchema = z.looseObject({ text: z.string().optional() })
+// nullish rather than optional: the protocol is protobuf JSON, where a field present but unset may arrive as `null`, and a
+// schema that rejects it would drop the whole item (and with it the message) instead of reporting what is missing.
+const TextItemSchema = z.looseObject({ text: z.string().nullish() })
 /** `CDNMedia`: the encrypted download parameter, an optional full URL, and the AES key in whichever encoding the item used. */
-const MediaSchema = z.looseObject({ encrypt_query_param: z.string().optional(), aes_key: z.string().optional(),
-  full_url: z.string().optional(), encrypt_type: z.number().optional() })
-const ImageItemSchema = z.looseObject({ media: MediaSchema.optional(), aeskey: z.string().optional(), mid_size: z.number().optional() })
-const RefMessageSchema = z.looseObject({ title: z.string().optional(),
-  message_item: z.looseObject({ type: z.number().optional(), text_item: TextItemSchema.optional() }).optional() })
-const ItemSchema = z.looseObject({ type: z.number(), text_item: TextItemSchema.optional(), voice_item: z.looseObject({ text: z.string().optional() }).optional(),
-  image_item: ImageItemSchema.optional(), ref_msg: RefMessageSchema.optional() })
+const MediaSchema = z.looseObject({ encrypt_query_param: z.string().nullish(), aes_key: z.string().nullish(),
+  full_url: z.string().nullish(), encrypt_type: z.number().nullish() })
+const ImageItemSchema = z.looseObject({ media: MediaSchema.nullish(), aeskey: z.string().nullish(), mid_size: z.number().nullish() })
+const RefMessageSchema = z.looseObject({ title: z.string().nullish(),
+  message_item: z.looseObject({ type: z.number().optional(), text_item: TextItemSchema.optional() }).nullish() })
+const ItemSchema = z.looseObject({ type: z.number(), text_item: TextItemSchema.optional(),
+  voice_item: z.looseObject({ text: z.string().nullish() }).optional(), image_item: ImageItemSchema.optional(), ref_msg: RefMessageSchema.optional() })
 /** One inbound update; `message_id` is optional in the references, which fall back to `seq`. */
 export const WeixinMessageSchema = z.looseObject({
   message_id: z.union([z.string(), z.number()]).optional(), seq: z.union([z.string(), z.number()]).optional(),
@@ -77,8 +79,14 @@ export function parseItems(items: readonly unknown[]): ParsedItems {
   return { text: [...quotes, ...texts].join('\n'), media, quoted: quotes.join('\n') }
 }
 /**
- * The download references of a message's image items, in order. The key may sit in `media.aes_key` (base64) or in the
- * item's own `aeskey` (usually hex); the runtime resolves either form and reports what it cannot download.
+ * The download references of a message's image items, in order.
+ *
+ * Field priority follows both references, which read the key from `image_item.aeskey` first and from
+ * `image_item.media.aes_key` only when that is empty: `@tencent-weixin/openclaw-weixin@2.4.6`
+ * `dist/src/media/media-download.js` does `img.aeskey ? Buffer.from(img.aeskey, "hex").toString("base64") : img.media.aes_key`,
+ * and CowAgent's `weixin_message.py` does `info.get("aeskey", "") or media.get("aes_key", "")`. An empty string counts as
+ * absent, which is why the `||` is not a style choice here. A reference missing everything is kept, so the Trigger can say
+ * which part is missing rather than silently dropping the picture.
  */
 export function inboundImages(items: readonly unknown[]): CdnMedia[] {
   const refs: CdnMedia[] = []
@@ -87,31 +95,33 @@ export function inboundImages(items: readonly unknown[]): CdnMedia[] {
     if (!parsed.success || parsed.data.type !== ITEM_IMAGE) continue
     const image = parsed.data.image_item
     if (!image) continue
-    const aesKey = image.media?.aes_key ?? image.aeskey
+    const itemKey = image.aeskey?.trim() || ''
+    const mediaKey = image.media?.aes_key?.trim() || ''
+    const aesKey = itemKey || mediaKey
     refs.push({
-      ...image.media?.encrypt_query_param ? { encryptQueryParam: image.media.encrypt_query_param } : {},
-      ...image.media?.full_url ? { fullUrl: image.media.full_url } : {},
-      ...aesKey ? { aesKey } : {},
+      ...image.media?.encrypt_query_param?.trim() ? { encryptQueryParam: image.media.encrypt_query_param.trim() } : {},
+      ...image.media?.full_url?.trim() ? { fullUrl: image.media.full_url.trim() } : {},
+      ...aesKey ? { aesKey, aesKeySource: itemKey ? 'image_item.aeskey' as const : 'media.aes_key' as const } : {},
     })
   }
   return refs
 }
-/** Where a message's own image items could not be downloaded: the text names that instead of dropping the message. */
-export const UNREAD_MEDIA = '[图片: 无法获取]'
+/** The text reference of one image that could not be fetched, naming the stage from {@link mediaFailureText}. */
+export const mediaFailureMarker = (reason: string): string => `[图片: 获取失败 ${reason}]`
 /**
  * Converts one inbound update into a Trigger, or returns undefined for anything this Source cannot represent: a group
  * message (iLink send has no group branch), a missing sender, a text-less media message nothing was stored for, or an empty
  * message.
  * @param message - one `msgs[]` entry of a `getUpdates` reply.
  * @param media - the images the runtime stored for this message; each adds its `[Image: <key>]` reference to the text.
- * @param unread - how many image items the runtime could not download; one note is added when any was.
+ * @param failures - why each image item could not be downloaded, one short reason per image; each adds its own note.
  */
 export function weixinTrigger(message: WeixinMessage, now = (): number => Date.now(), media: readonly StoredMedia[] = [],
-  unread = 0): Trigger | undefined {
+  failures: readonly string[] = []): Trigger | undefined {
   if (message.group_id) return undefined
   if (!message.from_user_id) return undefined
   const parsed = parseItems(message.item_list)
-  const markers = [...media.map(item => mediaMarker(item.key)), ...unread > 0 ? [UNREAD_MEDIA] : []]
+  const markers = [...media.map(item => mediaMarker(item.key)), ...failures.map(reason => mediaFailureMarker(reason))]
   const text = [parsed.text.trim(), ...markers].filter(part => part).join('\n')
   // A picture, file, video or untranscribed voice the runtime could not fetch has no text to carry: without a stored image
   // or an unread note there is nothing an assessment could act on, so it is not a Trigger.
