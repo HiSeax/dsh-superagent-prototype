@@ -88,7 +88,7 @@ const legacyTlsAgent = new HttpsAgent({ keepAlive: true, minVersion: 'TLSv1.2', 
 export const nodeCdnTransport: CdnTransport = {
   request(url, init) {
     const target = new URL(url)
-    if (target.protocol !== 'https:') return Promise.reject(new WeixinMediaError('network', `The WeChat CDN URL is not HTTPS: ${url}`))
+    if (target.protocol !== 'https:') return Promise.reject(new WeixinMediaError('network', `The WeChat CDN URL is not HTTPS (${target.protocol})`))
     return new Promise<CdnResponse>((resolve, reject) => {
       const headers: Record<string, string> = { ...init.body ? { 'Content-Length': String(init.body.byteLength) } : {}, ...init.headers }
       const request = httpsRequest(target, { method: init.method, agent: legacyTlsAgent, headers }, response => {
@@ -196,10 +196,13 @@ export interface MediaUpload { encryptQueryParam: string; aesKeyBase64: string; 
  * `x-encrypted-param` reply header as the download parameter a later `image_item` names.
  */
 export async function uploadMedia(api: Pick<WeixinApi, 'getUploadUrl'>, transport: CdnTransport,
-  input: { data: Uint8Array; toUserId: string; mediaType?: number; cdnBaseUrl?: string }): Promise<MediaUpload> {
+  input: { data: Uint8Array; toUserId: string; mediaType?: number; cdnBaseUrl?: string
+    /** The AES key to use; omitted in production (random per upload) and fixed by a test that checks the exact ciphertext. */
+    aesKey?: Uint8Array }): Promise<MediaUpload> {
   const data = Buffer.from(input.data)
   if (!data.length) throw new WeixinMediaError('protocol', 'An iLink media upload needs a non-empty file')
-  const key = randomBytes(AES_BLOCK)
+  const key = input.aesKey ? Buffer.from(input.aesKey) : randomBytes(AES_BLOCK)
+  if (key.length !== AES_BLOCK) throw new WeixinMediaError('bad-key', 'An iLink media key is exactly 16 bytes')
   const filekey = randomBytes(AES_BLOCK).toString('hex')
   const cipher = encryptMedia(data, key)
   const ticket = await api.getUploadUrl({ filekey, mediaType: input.mediaType ?? MEDIA_IMAGE, toUserId: input.toUserId,

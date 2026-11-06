@@ -78,7 +78,10 @@ function ensureOk(reply: Record<string, unknown>, what: string): void {
 const UpdatesSchema = z.looseObject({ ret: z.number().optional(), errcode: z.number().optional(), errmsg: z.string().optional(),
   msgs: z.array(z.unknown()).default([]), get_updates_buf: z.string().optional(), longpolling_timeout_ms: z.number().optional() })
 const QrCodeSchema = z.looseObject({ qrcode: z.string().min(1), qrcode_img_content: z.string().default('') })
-const UploadUrlSchema = z.looseObject({ upload_full_url: z.string().optional(), upload_param: z.string().optional() })
+// The reply is protobuf JSON: an unset field may be absent or `null`, and `upload_param` is documented as the legacy
+// alternative, so both forms are accepted and trimmed; an empty value counts as absent.
+const UploadUrlSchema = z.looseObject({ upload_full_url: z.string().nullish(), upload_param: z.string().nullish(),
+  ret: z.number().optional(), errcode: z.number().optional(), errmsg: z.string().nullish() })
 const QrStatusSchema = z.looseObject({ status: z.string(), redirect_host: z.string().optional(), bot_token: z.string().optional(),
   ilink_bot_id: z.string().optional(), ilink_user_id: z.string().optional(), baseurl: z.string().optional() })
 export type QrStatus = z.infer<typeof QrStatusSchema>
@@ -142,10 +145,17 @@ export class WeixinApi {
     const reply = await this.post('ilink/bot/getuploadurl', { filekey: request.filekey, media_type: request.mediaType,
       to_user_id: request.toUserId, rawsize: request.rawSize, rawfilemd5: request.rawMd5, filesize: request.cipherSize,
       aeskey: request.aesKeyHex, no_need_thumb: true }, this.timeouts.request, 'getUploadUrl')
-    ensureOk(reply, 'getUploadUrl')
     const ticket = UploadUrlSchema.parse(reply)
-    return { ...ticket.upload_full_url ? { uploadFullUrl: ticket.upload_full_url } : {},
-      ...ticket.upload_param ? { uploadParam: ticket.upload_param } : {} }
+    const uploadFullUrl = ticket.upload_full_url?.trim() ?? ''
+    const uploadParam = ticket.upload_param?.trim() ?? ''
+    // The official client does not gate this call on `ret`/`errcode`; a usable CDN ticket is what matters, and a reply
+    // without one is the failure. Requiring ret=0 here would turn a reply that still carries `upload_full_url` into an
+    // upload that never starts, which is exactly the stage the caller cannot see.
+    if (!uploadFullUrl && !uploadParam) {
+      throw new WeixinApiError(Number(ticket.ret ?? reply.ret ?? 0), Number(ticket.errcode ?? reply.errcode ?? 0),
+        String(ticket.errmsg ?? reply.errmsg ?? ''), 'getUploadUrl')
+    }
+    return { ...uploadFullUrl ? { uploadFullUrl } : {}, ...uploadParam ? { uploadParam } : {} }
   }
   /**
    * Sends one uploaded image as its own message, the way the references send media: `item_list` carries one item, and a
