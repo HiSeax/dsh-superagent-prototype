@@ -15,7 +15,7 @@
  *   retry loop. A failed login is left for a restart instead of issuing QR codes nobody scans.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname, isAbsolute, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { OutboundAttachment, OutboundMessage } from '../core/index.ts'
 import { KV } from '../kv.ts'
@@ -24,19 +24,23 @@ import { DEFAULT_BASE_URL, WeixinApi, fetchQrCode, isAuthError, pollQrStatus, ty
 import type { WeixinConfig } from './weixin-config.ts'
 import { loginQr, type LoginQrFiles } from './weixin-qr.ts'
 import { downloadMedia, isImageMime, mediaDirectory, mediaFailureText, mediaReport, mediaUrlLabel, nodeCdnTransport, sniffImage,
-  storeMedia, uploadMedia, MEDIA_IMAGE, type CdnTransport, type StoredMedia } from './weixin-media.ts'
+  storeMedia, uploadMedia, MEDIA_IMAGE, type CdnTransport, type MediaUpload, type StoredMedia } from './weixin-media.ts'
 import { SOURCE, WeixinMessageSchema, inboundImages, weixinTrigger, type WeixinMessage } from './weixin-trigger.ts'
 
 /** Login state of the Source: the saved token, the pending QR scan, or the error that stopped it. */
 export const WEIXIN_LOGIN = 'weixin'
 /** Health of the `getUpdates` long poll. */
 export const WEIXIN_POLL = 'weixin-poll'
-/** Health of replies, including the 24-hour send window. */
+/** Health of the sendMessage stage of replies, including the 24-hour send window. */
 export const WEIXIN_SEND = 'weixin-send'
+/** Health of the outgoing-image upload stage: an image is encrypted and POSTed to the WeChat CDN before any sendMessage. */
+export const WEIXIN_UPLOAD = 'weixin-upload'
 /** Health of received media: how many images are stored, and how many are past the retention; nothing is ever deleted. */
 export const WEIXIN_MEDIA = 'weixin-media'
 /** The health entries the kind claims, in display order. */
-export const WEIXIN_HEALTH = [WEIXIN_LOGIN, WEIXIN_POLL, WEIXIN_SEND, WEIXIN_MEDIA]
+export const WEIXIN_HEALTH = [WEIXIN_LOGIN, WEIXIN_POLL, WEIXIN_SEND, WEIXIN_UPLOAD, WEIXIN_MEDIA]
+/** Which stage of a reply failed, named in the send health entry so a pending receipt says how far it got. */
+type SendStage = 'text' | 'prepare' | 'upload' | 'send'
 /** `MessageItem` text is chunked at 4000 characters, the limit CowAgent's Weixin channel sends. */
 const TEXT_CHUNK = 4000
 /** How many images one message may carry in either direction; more are counted as unread and reported, not sent. */
@@ -191,11 +195,11 @@ export class WeixinBot {
     if (attachments.length > MAX_IMAGES) throw new Error(`A WeChat reply carries at most ${MAX_IMAGES} images`)
     const contextToken = context.state.get(KV.weixin.context(userId))
     if (!contextToken) {
-      this.failSend('this person has no context token yet, which iLink stores from their latest message')
+      this.failSend('text', 'this person has no context token yet, which iLink stores from their latest message')
       throw new Error('The iLink send has no context token for this sender yet')
     }
     if (!this.api && !this.connect()) {
-      this.failSend('the Weixin bot is not logged in')
+      this.failSend('text', 'the Weixin bot is not logged in')
       throw new Error('The Weixin bot is not logged in; scan the QR code shown on the Source card')
     }
     const api = this.api!
@@ -209,7 +213,7 @@ export class WeixinBot {
         if (isAuthError(error)) {
           context.report(WEIXIN_LOGIN, { state: 'error', at: this.stamp(), detail: 'The bot token is stale; scan the QR code again' })
         }
-        this.failSend(describe(error))
+        this.failSend('text', describe(error))
         throw error
       }
       context.state.set(KV.weixin.sent(replyId), true)
@@ -219,12 +223,12 @@ export class WeixinBot {
       const replyId = `${message.id}@image-${index}`
       if (context.state.get(KV.weixin.sent(replyId))) continue
       try {
-        await this.sendImage(api, userId, contextToken, attachment, `dsh-superagent-image-${replyId}`)
+        // client_id stays a short, opaque, retry-stable token: no `@`/`#` from the message id, and well under a uuid's length.
+        await this.sendImage(api, userId, contextToken, attachment, `dsh-superagent-img-${index}-${message.id}`, message.id)
       } catch (error) {
         if (isAuthError(error)) {
           context.report(WEIXIN_LOGIN, { state: 'error', at: this.stamp(), detail: 'The bot token is stale; scan the QR code again' })
         }
-        this.failSend(describe(error))
         throw error
       }
       context.state.set(KV.weixin.sent(replyId), true)
@@ -233,24 +237,62 @@ export class WeixinBot {
     return 'sent'
   }
   /**
-   * Uploads one local image to the WeChat CDN and sends it as an `image_item`. Only the image types a model reads are
-   * carried, and the configured size limit applies before anything is encrypted or uploaded.
+   * Uploads one local image to the WeChat CDN and sends it as an `image_item`, reporting each stage on its own health entry:
+   * `weixin-upload` for the ticket, encryption and CDN POST, `weixin-send` for the sendMessage. A failure names its stage in
+   * both the health entry and the warning line, so a receipt stuck at `pending` says how far the image got.
    */
-  private async sendImage(api: WeixinApi, userId: string, contextToken: string, attachment: OutboundAttachment, clientId: string): Promise<void> {
+  private async sendImage(api: WeixinApi, userId: string, contextToken: string, attachment: OutboundAttachment,
+    clientId: string, messageId: string): Promise<void> {
+    const name = basename(attachment.path)
+    let data: Buffer
+    try {
+      data = this.readAttachment(attachment)
+    } catch (error) {
+      this.reportUpload('error', `Could not prepare ${name} for upload: ${describe(error)}`)
+      this.failSend('prepare', `${name}: ${describe(error)}`)
+      this.log(`image prepare failed message=${messageId} file=${name} reason=${describe(error)}`)
+      throw error
+    }
+    const config = this.config()!
+    this.reportUpload('starting', `Uploading ${name} (${data.length} bytes) to the WeChat CDN`)
+    let upload: MediaUpload
+    try {
+      upload = await uploadMedia(api, this.cdn, { data, toUserId: userId, mediaType: MEDIA_IMAGE, cdnBaseUrl: config.cdnBaseUrl })
+    } catch (error) {
+      this.reportUpload('error', `Could not upload ${name} to the WeChat CDN: ${describe(error)}`)
+      this.failSend('upload', `${name}: ${describe(error)}`)
+      this.log(`image upload failed message=${messageId} file=${name} reason=${describe(error)}`)
+      throw error
+    }
+    // Neither the CDN parameter nor the AES key is logged; sizes and the file name are enough to check the stage.
+    this.reportUpload('ready', `Uploaded ${name}: ${upload.rawSize} bytes, ${upload.ciphertextSize} bytes encrypted`)
+    this.log(`image upload ok message=${messageId} file=${name} raw=${upload.rawSize} cipher=${upload.ciphertextSize}`)
+    try {
+      await api.sendImage(userId, contextToken, clientId, { encryptQueryParam: upload.encryptQueryParam,
+        aesKeyBase64: upload.aesKeyBase64, ciphertextSize: upload.ciphertextSize })
+    } catch (error) {
+      this.failSend('send', `${name}: ${describe(error)}`)
+      this.log(`image send failed message=${messageId} file=${name} clientId=${clientId} reason=${describe(error)}`)
+      throw error
+    }
+    this.log(`image send ok message=${messageId} file=${name} clientId=${clientId}`)
+  }
+  /** Reads and validates one attachment before any network call: a local image file within the configured size limit. */
+  private readAttachment(attachment: OutboundAttachment): Buffer {
     const config = this.config()
     if (!config) throw new Error('The Weixin Source is not configured')
     if (attachment.mime && !isImageMime(attachment.mime)) throw new Error(`WeChat cannot carry ${attachment.mime}; only PNG, JPEG, WebP and GIF images are supported`)
     const data = readFileSync(attachment.path)
     if (data.length > config.maxMediaBytes) throw new Error(`the image is larger than the Media size limit of ${config.maxMediaBytes} bytes`)
-    const image = sniffImage(data)
-    if (!image) throw new Error(`the file ${attachment.path} is not a PNG, JPEG, WebP or GIF image`)
-    const upload = await uploadMedia(api, this.cdn, { data, toUserId: userId, mediaType: MEDIA_IMAGE, cdnBaseUrl: config.cdnBaseUrl })
-    await api.sendImage(userId, contextToken, clientId, { encryptQueryParam: upload.encryptQueryParam,
-      aesKeyBase64: upload.aesKeyBase64, ciphertextSize: upload.ciphertextSize })
+    if (!sniffImage(data)) throw new Error(`the file ${attachment.path} is not a PNG, JPEG, WebP or GIF image`)
+    return data
   }
-  private failSend(detail: string): void {
+  private reportUpload(state: 'starting' | 'ready' | 'error', detail: string): void {
+    this.context?.report(WEIXIN_UPLOAD, { state, detail, at: this.stamp() })
+  }
+  private failSend(stage: SendStage, detail: string): void {
     this.context?.report(WEIXIN_SEND, { state: 'error', at: this.stamp(),
-      detail: `Could not send the reply: ${detail}. iLink lets the bot push only within 24 hours of the person's last message, so they must send the bot another message to reopen the window.` })
+      detail: `Could not send the reply (${stage}): ${detail}. iLink lets the bot push only within 24 hours of the person's last message, so they must send the bot another message to reopen the window.` })
   }
   private stamp(): string { return new Date(this.clock()).toISOString() }
   private reportLogin(state: 'starting' | 'ready' | 'paused' | 'error', detail: string): void {
@@ -472,6 +514,8 @@ export class WeixinBot {
       }
       const credentials = this.credentials!
       this.reportLogin('ready', `Logged in as ${credentials.botId}`)
+      // Declare the upload stage from the start of a connection, so the panel shows it before the first outgoing image.
+      this.reportUpload('ready', 'No outgoing image has been uploaded since this connection started')
       // Best-effort lifecycle notices, 推定，未验证: the references say a failure must not block the message loop.
       await this.api!.notify('start').catch(() => {})
       const outcome = await this.poll(signal)

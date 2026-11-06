@@ -12,7 +12,7 @@ import { key, type OutboundMessage, type Trigger } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
 import type { Health, SourceContext } from '../src/sources/host.ts'
 import type { FetchResponse, Fetcher, UploadUrlRequest } from '../src/sources/weixin-api.ts'
-import { WEIXIN_LOGIN, WEIXIN_MEDIA, WEIXIN_SEND, WeixinBot } from '../src/sources/weixin-bot.ts'
+import { WEIXIN_LOGIN, WEIXIN_MEDIA, WEIXIN_SEND, WEIXIN_UPLOAD, WeixinBot } from '../src/sources/weixin-bot.ts'
 import { WeixinConfigSchema, type WeixinConfig } from '../src/sources/weixin-config.ts'
 import { weixinThreadContext } from '../src/sources/weixin-read.ts'
 import { SOURCE, inboundImages, mediaFailureMarker } from '../src/sources/weixin-trigger.ts'
@@ -42,10 +42,12 @@ function transport(answer: (call: Call) => { status?: number; body?: unknown }) 
   return { calls, fetcher }
 }
 /** A CDN transport answering every request from `answer`. */
-function cdn(answer: (url: string, init: { method: string; body?: Uint8Array }) => CdnResponse) {
-  const calls: { url: string; method: string; body: Buffer }[] = []
-  const cdnTransport: CdnTransport = { request: async (url, init) => { calls.push({ url, method: init.method, body: Buffer.from(init.body ?? []) })
-    return answer(url, init) } }
+function cdn(answer: (url: string, init: { method: string; body?: Uint8Array; headers?: Record<string, string> }) => CdnResponse) {
+  const calls: { url: string; method: string; body: Buffer; headers: Record<string, string> }[] = []
+  const cdnTransport: CdnTransport = { request: async (url, init) => {
+    calls.push({ url, method: init.method, body: Buffer.from(init.body ?? []), headers: init.headers ?? {} })
+    return answer(url, init)
+  } }
   return { calls, cdn: cdnTransport }
 }
 /** A Source context over an in-memory state map and a temporary state directory. */
@@ -135,6 +137,26 @@ describe('weixin media upload', () => {
     expect(decryptMedia(ciphertext, Buffer.from(ticket!.aesKeyHex, 'hex'))).toEqual(data)
     expect(uploaded).toEqual({ encryptQueryParam: 'download-param', ciphertextSize: ciphertext.length, rawSize: data.length,
       aesKeyBase64: mediaKeyField(Buffer.from(ticket!.aesKeyHex, 'hex')) })
+  })
+  it('produces the exact wire envelope for a fixed key: AES-128-ECB/PKCS#7 body and base64(hex32) aes_key', async () => {
+    const key = Buffer.from('00112233445566778899aabbccddeeff', 'hex')
+    const plaintext = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from('weixin image bytes')])
+    const requests = cdn(() => ({ status: 200, headers: { 'x-encrypted-param': 'download-param' }, body: Buffer.alloc(0) }))
+    let ticket: UploadUrlRequest | undefined
+    const uploaded = await uploadMedia({
+      getUploadUrl: async (request: UploadUrlRequest) => { ticket = request; return { uploadParam: 'upload-param' } },
+    }, requests.cdn, { data: plaintext, toUserId: 'wxid_alice', aesKey: key })
+    expect(ticket).toMatchObject({ mediaType: 1, rawSize: plaintext.length,
+      rawMd5: createHash('md5').update(plaintext).digest('hex'), cipherSize: paddedMediaSize(plaintext.length), aesKeyHex: key.toString('hex') })
+    // Crypto is computed by Node's own PKCS#7 padding, independently of the module's encryptMedia.
+    const expected = encryptWith(plaintext, key.toString('hex'))
+    expect(requests.calls[0]!.method).toBe('POST')
+    expect(requests.calls[0]!.headers).toMatchObject({ 'Content-Type': 'application/octet-stream' })
+    expect(requests.calls[0]!.body).toEqual(expected)
+    expect(requests.calls[0]!.body.length).toBe(paddedMediaSize(plaintext.length))
+    // The sendMessage field is base64 of the 32-character hex key, the form both references send.
+    expect(uploaded).toEqual({ encryptQueryParam: 'download-param', ciphertextSize: expected.length, rawSize: plaintext.length,
+      aesKeyBase64: Buffer.from(key.toString('hex')).toString('base64') })
   })
   it('prefers upload_full_url and surfaces a CDN refusal instead of a silent send', async () => {
     const requests = cdn(() => ({ status: 200, headers: { 'x-encrypted-param': 'param' }, body: Buffer.alloc(0) }))
@@ -390,20 +412,83 @@ describe('weixin bot media', () => {
     expect(calls.map(call => call.url.includes('/ilink/bot/getuploadurl') ? 'upload' : 'send')).toEqual(['send', 'upload', 'send'])
     const ticket = JSON.parse(calls[1]!.body) as Record<string, unknown>
     expect(ticket).toMatchObject({ media_type: 1, to_user_id: 'wxid_alice', rawsize: image.length, filesize: paddedMediaSize(image.length), no_need_thumb: true })
-    expect(ticket.aeskey).toMatch(/^[0-9a-f]{32}$/)
-    const sends = calls.filter(call => call.url.includes('/ilink/bot/sendmessage')).map(call => JSON.parse(call.body) as { msg: { item_list: { type: number }[] } })
+    const hexKey = String(ticket.aeskey)
+    expect(hexKey).toMatch(/^[0-9a-f]{32}$/)
+    const sends = calls.filter(call => call.url.includes('/ilink/bot/sendmessage')).map(call => JSON.parse(call.body) as { msg: { item_list: unknown[] } })
     expect(sends).toHaveLength(2)
     expect(sends[0]!.msg.item_list).toEqual([{ type: 1, text_item: { text: '收到，图见下。' } }])
-    expect(sends[1]!.msg.item_list[0]).toMatchObject({ type: 2, image_item: { media: { encrypt_query_param: 'dl-param', encrypt_type: 1 },
-      mid_size: paddedMediaSize(image.length) } })
-    const aesKey = (sends[1]!.msg.item_list[0] as unknown as { image_item: { media: { aes_key: string } } }).image_item.media.aes_key
-    expect(resolveMediaKey(aesKey)).toHaveLength(16)
+    // The full image_item of the sendMessage: the CDN header's parameter, base64(hex32) key, ciphertext size, encrypt_type 1.
+    expect(sends[1]!.msg.item_list).toEqual([{ type: 2, image_item: {
+      media: { encrypt_query_param: 'dl-param', aes_key: Buffer.from(hexKey).toString('base64'), encrypt_type: 1 },
+      mid_size: paddedMediaSize(image.length) } }])
     expect(media.calls[0]!.method).toBe('POST')
     expect(state.get(KV.weixin.sent('with-image@image-0'))).toBe(true)
     // A retry of the same OutboundMessage sends nothing again.
     expect(await bot.send({ ...reply('with-image'), attachments: [{ path: file, mime: 'image/jpeg' }] })).toBe('sent')
     expect(calls).toHaveLength(3)
     expect(reports[WEIXIN_SEND]).toMatchObject({ state: 'ready' })
+    expect(reports[WEIXIN_UPLOAD]).toMatchObject({ state: 'ready' })
+  })
+  it('reports the upload stage separately when the CDN refuses the image', async () => {
+    const directory = directoryOf(); saveLogin(directory)
+    const file = join(directory, 'plot.jpg')
+    writeFileSync(file, jpeg(24))
+    const reports: Record<string, Health> = {}
+    const { context, state } = host(directory, reports)
+    state.set(KV.weixin.context('wxid_alice'), 'ctx-1')
+    const media = cdn(() => ({ status: 403, headers: {}, body: Buffer.from('forbidden') }))
+    const { fetcher } = transport(call => {
+      if (call.url.includes('/ilink/bot/getuploadurl')) return { body: { ret: 0, upload_param: 'upload-param' } }
+      return { body: { ret: 0 } }
+    })
+    const bot = botOf(fetcher, { cdn: media.cdn })
+    bot.attach(context); expect(bot.connect()).toBe(true)
+    await expect(bot.send({ ...reply('upload-refused'), attachments: [{ path: file }] })).rejects.toThrow('HTTP 403')
+    expect(reports[WEIXIN_UPLOAD]).toMatchObject({ state: 'error' })
+    expect(String(reports[WEIXIN_UPLOAD]!.detail)).toContain('Could not upload')
+    expect(String(reports[WEIXIN_UPLOAD]!.detail)).toContain('HTTP 403')
+    // The send stage never ran; its entry says which stage failed instead of blaming the 24-hour window alone.
+    expect(reports[WEIXIN_SEND]).toMatchObject({ state: 'error' })
+    expect(String(reports[WEIXIN_SEND]!.detail)).toContain('(upload)')
+  })
+  it('reports a sendMessage failure as the send stage after the upload succeeded', async () => {
+    const directory = directoryOf(); saveLogin(directory)
+    const file = join(directory, 'plot.jpg')
+    writeFileSync(file, jpeg(24))
+    const reports: Record<string, Health> = {}
+    const { context, state } = host(directory, reports)
+    state.set(KV.weixin.context('wxid_alice'), 'ctx-1')
+    const media = cdn(() => ({ status: 200, headers: { 'x-encrypted-param': 'dl-param' }, body: Buffer.alloc(0) }))
+    const { fetcher } = transport(call => call.url.includes('/ilink/bot/getuploadurl')
+      ? { body: { ret: 0, upload_param: 'upload-param' } } : { body: { ret: 500, errmsg: 'busy' } })
+    const bot = botOf(fetcher, { cdn: media.cdn })
+    bot.attach(context); expect(bot.connect()).toBe(true)
+    // Attachment-only, so the first sendMessage is the image and the upload stage really ran.
+    await expect(bot.send({ ...reply('send-failed'), text: '', attachments: [{ path: file }] })).rejects.toThrow('sendMessage failed')
+    expect(reports[WEIXIN_UPLOAD]).toMatchObject({ state: 'ready' })
+    expect(reports[WEIXIN_SEND]).toMatchObject({ state: 'error' })
+    expect(String(reports[WEIXIN_SEND]!.detail)).toContain('(send)')
+    expect(String(reports[WEIXIN_SEND]!.detail)).toContain('sendMessage failed')
+  })
+  it('accepts a null upload_full_url from getuploadurl and falls back to upload_param', async () => {
+    const directory = directoryOf(); saveLogin(directory)
+    const file = join(directory, 'plot.jpg')
+    writeFileSync(file, jpeg(24))
+    const reports: Record<string, Health> = {}
+    const { context, state } = host(directory, reports)
+    state.set(KV.weixin.context('wxid_alice'), 'ctx-1')
+    const media = cdn(() => ({ status: 200, headers: { 'x-encrypted-param': 'dl-param' }, body: Buffer.alloc(0) }))
+    const { calls, fetcher } = transport(call => {
+      // protobuf JSON often carries the unset alternative as null; a strict schema would have failed the upload here.
+      if (call.url.includes('/ilink/bot/getuploadurl')) return { body: { ret: 0, upload_full_url: null, upload_param: ' upload-param ' } }
+      return { body: { ret: 0 } }
+    })
+    const bot = botOf(fetcher, { cdn: media.cdn })
+    bot.attach(context); expect(bot.connect()).toBe(true)
+    expect(await bot.send({ ...reply('null-ticket'), text: '', attachments: [{ path: file }] })).toBe('sent')
+    const ticket = JSON.parse(calls[0]!.body) as { filekey: string }
+    expect(media.calls[0]!.url).toBe(`https://novac2c.cdn.weixin.qq.com/c2c/upload?encrypted_query_param=upload-param&filekey=${ticket.filekey}`)
+    expect(reports[WEIXIN_UPLOAD]).toMatchObject({ state: 'ready' })
   })
   it('refuses an attachment that is not an image and reports why, keeping text sends distinct', async () => {
     const directory = directoryOf(); saveLogin(directory)
@@ -417,7 +502,10 @@ describe('weixin bot media', () => {
     const bot = botOf(fetcher, { cdn: media.cdn })
     bot.attach(context); expect(bot.connect()).toBe(true)
     await expect(bot.send({ ...reply('bad-image'), attachments: [{ path: file }] })).rejects.toThrow('not a PNG, JPEG, WebP or GIF image')
+    expect(reports[WEIXIN_UPLOAD]).toMatchObject({ state: 'error' })
+    expect(String(reports[WEIXIN_UPLOAD]!.detail)).toContain('prepare')
     expect(reports[WEIXIN_SEND]).toMatchObject({ state: 'error' })
+    expect(String(reports[WEIXIN_SEND]!.detail)).toContain('(prepare)')
     expect(calls).toHaveLength(1) // only the text went out; nothing was uploaded
     await expect(bot.send({ ...reply('declared-type'), attachments: [{ path: file, mime: 'text/plain' }] })).rejects.toThrow('cannot carry text/plain')
   })
